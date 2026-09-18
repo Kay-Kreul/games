@@ -26,10 +26,15 @@ TILE = 64
 # resolution.  The renderer fills each band, so there are no gaps between it.
 # Larger bands substantially reduce Tk canvas work while remaining visually
 # smooth at fullscreen resolution.
-RENDER_COLUMN_STEP = 6
+# Fewer, wider bands greatly reduce Tk canvas work.  Wall shading and the
+# world-locked texture below keep the result smooth at fullscreen size.
+RENDER_COLUMN_STEP = 8
 MAP_SEED = random.SystemRandom().randint(0, 2**31 - 1)
-PLAYER_RADIUS = 18
+# Keep the collision margin close to the player's visible center so walls do
+# not feel like they have an oversized invisible border.
+PLAYER_RADIUS = 10
 ENEMY_RADIUS = 20
+ENEMY_AGGRO_RANGE = 360
 player = [2.5 * TILE, 2.5 * TILE]
 angle = 0.0
 health = 100
@@ -227,7 +232,10 @@ def open_internet_port(port):
     if service is None:
       return None
     control = urllib.parse.urljoin(location, service.findtext("u:controlURL", "", namespace))
-    local_ip = sock.getsockname()[0]
+    # A UDP socket used for SSDP commonly reports 0.0.0.0 here.  Supplying
+    # that address to the router makes the mapping unusable from the
+    # internet, so resolve the actual LAN address separately.
+    local_ip = get_local_ip()
     body = ("<?xml version=\"1.0\"?>"
             "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
             "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>"
@@ -322,6 +330,8 @@ def network_loop(sock):
             if visible(player[0], player[1]) and difference < (0.45 if weapon else 0.08):
               damage = 12 if not weapon else max(5, int(50 * max(0.0, 1 - distance / 500)))
               was_alive = health > 0
+              if was_alive:
+                add_damage_indicator(shooter[0], shooter[1])
               health = max(0, health - damage)
               if was_alive and health <= 0:
                 send_network_kill(parts[1], PLAYER_ID)
@@ -403,7 +413,9 @@ def start_network():
     if mode == "--host":
       public_ip = get_public_ip()
       endpoint = f"{public_ip}:{port}" if public_ip else f"<public-ip>:{port}"
-      print(f"Hosting multiplayer at {endpoint}. Waiting for a player to join...")
+      local_endpoint = f"{get_local_ip()}:{port}"
+      print(f"Hosting multiplayer at {endpoint} (LAN: {local_endpoint}).")
+      print("Give the public address to internet players; allow TCP this port in the firewall.")
       listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
       listener.bind(("0.0.0.0", port))
@@ -413,7 +425,14 @@ def start_network():
       # local client connected, and made hosting over the internet awkward.
       network = listener
       network_status = "WAITING FOR PLAYER"
-      threading.Thread(target=open_internet_port, args=(port,), daemon=True).start()
+      def configure_router():
+        mapped_ip = open_internet_port(port)
+        if mapped_ip:
+          print(f"Router port forwarding enabled for {mapped_ip}:{port}.")
+        else:
+          print("Automatic port forwarding unavailable; forward TCP port "
+                f"{port} to {get_local_ip()} manually if needed.")
+      threading.Thread(target=configure_router, daemon=True).start()
       threading.Thread(target=accept_late_players, args=(listener,), daemon=True).start()
       threading.Thread(target=announce_host, args=(port,), daemon=True).start()
     elif mode == "--join" and len(sys.argv) > 2:
@@ -544,7 +563,10 @@ def make_map():
   # process-global RNG here because its state can differ between players.
   map_random = random.Random(MAP_SEED)
   width, height = 16, 11
-  protected = {(x, y) for x, y in [(2, 2), (3, 2), (2, 3)]}
+  # Keep a small area around the initial spawn clear as well.  This prevents
+  # the player's circular hitbox from touching a wall immediately after a
+  # level starts.
+  protected = {(x, y) for x in range(1, 4) for y in range(1, 4)}
   protected.update((int(x), int(y)) for x, y in ENEMY_STARTS)
   rows = []
   for y in range(height):
@@ -558,6 +580,40 @@ def make_map():
   # Keep the initial routes and enemy cells usable on every generated map.
   for x, y in protected:
     rows[y] = rows[y][:x] + "." + rows[y][x + 1:]
+
+  # Random walls can otherwise create isolated rooms.  Join every floor
+  # region to the starting region by carving a simple route through walls.
+  # This preserves the random layout while guaranteeing that every part of
+  # the map is reachable.
+  def reachable():
+    seen = {(2, 2)}
+    pending = [(2, 2)]
+    while pending:
+      x, y = pending.pop()
+      for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+        if (0 <= nx < width and 0 <= ny < height and
+            rows[ny][nx] == "." and (nx, ny) not in seen):
+          seen.add((nx, ny))
+          pending.append((nx, ny))
+    return seen
+
+  connected = reachable()
+  while True:
+    isolated = [(x, y) for y, row in enumerate(rows) for x, cell in enumerate(row)
+                if cell == "." and (x, y) not in connected]
+    if not isolated:
+      break
+    target = min(isolated, key=lambda cell: min(
+        abs(cell[0] - x) + abs(cell[1] - y) for x, y in connected))
+    x, y = target
+    while (x, y) not in connected:
+      rows[y] = rows[y][:x] + "." + rows[y][x + 1:]
+      candidates = [(nx, ny) for nx, ny in
+                    ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1))
+                    if 0 <= nx < width and 0 <= ny < height]
+      x, y = min(candidates, key=lambda cell: min(
+          abs(cell[0] - cx) + abs(cell[1] - cy) for cx, cy in connected))
+    connected = reachable()
   return rows
 
 
@@ -593,6 +649,9 @@ look_velocity = 0.0
 mouse_turn = 0.0
 muzzle_flash = 0.0
 damage_indicators = []
+enemy_projectiles = []
+enemy_shot_times = {}
+last_damage_indicator_time = 0.0
 pickup_bob = 0.0
 gunshot_audio = None
 last_tick_time = time.perf_counter()
@@ -601,6 +660,8 @@ root = tk.Tk()
 
 root.title("HOPE: The Python Experiment")
 fullscreen = True
+mouse_sensitivity = 0.00045
+settings_window = None
 root.attributes("-fullscreen", fullscreen)
 root.update_idletasks()
 WIDTH, HEIGHT = root.winfo_screenwidth(), root.winfo_screenheight()
@@ -782,24 +843,75 @@ def toggle_fullscreen():
     root.focus_force()
 
 
+def show_settings():
+  """Open the settings window without leaving the current game."""
+  global settings_window, mouse_sensitivity
+  if settings_window is not None and settings_window.winfo_exists():
+    settings_window.focus_force()
+    return
+  unlock_mouse()
+  settings_window = tk.Toplevel(root)
+  settings_window.title("HOPE SETTINGS")
+  settings_window.geometry("360x245")
+  settings_window.resizable(False, False)
+  settings_window.transient(root)
+  settings_window.grab_set()
+  settings_window.focus_force()
+  tk.Label(settings_window, text="Settings", font=("Consolas", 18, "bold")).pack(pady=12)
+
+  fullscreen_var = tk.BooleanVar(value=fullscreen)
+  tk.Checkbutton(settings_window, text="Fullscreen", variable=fullscreen_var,
+                 command=lambda: (set_fullscreen(fullscreen_var.get()))).pack()
+  tk.Label(settings_window, text="Mouse sensitivity").pack(pady=(10, 0))
+  sensitivity = tk.DoubleVar(value=mouse_sensitivity * 100000)
+  tk.Scale(settings_window, from_=10, to=100, orient="horizontal", length=250,
+           variable=sensitivity, command=lambda value: set_mouse_sensitivity(value)).pack()
+
+  def close_settings():
+    global settings_window
+    if settings_window is not None and settings_window.winfo_exists():
+      settings_window.grab_release()
+      settings_window.destroy()
+    settings_window = None
+    if not game_over:
+      lock_mouse()
+
+  tk.Button(settings_window, text="Close", width=18, command=close_settings).pack(pady=12)
+  settings_window.protocol("WM_DELETE_WINDOW", close_settings)
+
+
+def set_fullscreen(enabled):
+  global fullscreen
+  fullscreen = bool(enabled)
+  root.attributes("-fullscreen", fullscreen)
+
+
+def set_mouse_sensitivity(value):
+  global mouse_sensitivity
+  mouse_sensitivity = max(0.0001, float(value) / 100000)
+
+
 def blocked(x, y):
     gx, gy = int(x // TILE), int(y // TILE)
     return gy < 0 or gy >= len(MAP) or gx < 0 or gx >= len(MAP[0]) or MAP[gy][gx] == "1"
 
 
 def circle_hits_wall(x, y, radius):
-  """Use a true circular hitbox against nearby wall rectangles."""
-  left = max(0, int((x - radius) // TILE) - 1)
-  right = min(len(MAP[0]) - 1, int((x + radius) // TILE) + 1)
-  top = max(0, int((y - radius) // TILE) - 1)
-  bottom = min(len(MAP) - 1, int((y + radius) // TILE) + 1)
+  """Return whether a circle overlaps the rectangular map wall cells."""
+  # Include every cell touched by the circle.  Using the circle bounds here
+  # keeps collision coordinates aligned with the same TILE boundaries used by
+  # blocked() and cast_wall_ray().
+  left = max(0, math.floor((x - radius) / TILE))
+  right = min(len(MAP[0]) - 1, math.floor((x + radius) / TILE))
+  top = max(0, math.floor((y - radius) / TILE))
+  bottom = min(len(MAP) - 1, math.floor((y + radius) / TILE))
   for gy in range(top, bottom + 1):
     for gx in range(left, right + 1):
       if MAP[gy][gx] != "1":
         continue
       nearest_x = max(gx * TILE, min(x, (gx + 1) * TILE))
       nearest_y = max(gy * TILE, min(y, (gy + 1) * TILE))
-      if math.hypot(x - nearest_x, y - nearest_y) < radius:
+      if math.hypot(x - nearest_x, y - nearest_y) <= radius:
         return True
   return False
 
@@ -827,7 +939,14 @@ def visible(x, y):
 
 def add_damage_indicator(source_x, source_y):
   """Queue a brief indicator pointing from the attacker toward the player."""
-  direction = math.atan2(player[1] - source_y, player[0] - source_x)
+  global last_damage_indicator_time
+  now = time.perf_counter()
+  if now - last_damage_indicator_time < 0.12:
+    return
+  last_damage_indicator_time = now
+  # Point toward the attacker from the player's position, not back toward
+  # the player.  This keeps the indicator aligned with the enemy on screen.
+  direction = math.atan2(source_y - player[1], source_x - player[0])
   damage_indicators.append([direction, 0.7])
 
 
@@ -837,23 +956,35 @@ def draw_damage_indicators():
   radius = min(WIDTH, HEIGHT) * 0.38
   for direction, remaining in damage_indicators:
     relative = (direction - angle + math.pi) % (2 * math.pi) - math.pi
-    x = center_x + math.cos(relative) * radius
-    y = center_y + math.sin(relative) * radius
-    tip = (x + math.cos(relative) * 28, y + math.sin(relative) * 28)
-    side = relative + math.pi / 2
-    left = (x + math.cos(side) * 13, y + math.sin(side) * 13)
-    right = (x - math.cos(side) * 13, y - math.sin(side) * 13)
+    # Map the enemy's bearing into screen space: forward is up and right is
+    # right, so the indicator points to the attacker's actual direction.
+    direction_x, direction_y = math.sin(relative), -math.cos(relative)
+    x = center_x + direction_x * radius
+    y = center_y + direction_y * radius
+    tip = (x + direction_x * 38, y + direction_y * 38)
+    side = math.atan2(direction_y, direction_x) + math.pi / 2
+    left = (x + math.cos(side) * 18, y + math.sin(side) * 18)
+    right = (x - math.cos(side) * 18, y - math.sin(side) * 18)
     intensity = max(0.35, remaining / 0.7)
     red = int(255 * intensity)
-    canvas.create_polygon(tip, left, right, fill="#%02x3030" % red,
-                          outline="#ffb0b0", width=2)
+    color = "#%02x2020" % red
+    canvas.create_polygon(tip, left, right, fill=color,
+                outline="#ffb0b0", width=3)
+    # Keep the warning readable even when the attacker is off-screen.
+    canvas.create_text(x, y - 26, text="DAMAGE", fill="#ff7070",
+               font=("Consolas", 11, "bold"))
 
 
 def move(dx, dy):
-  if not circle_hits_wall(player[0] + dx, player[1], PLAYER_RADIUS):
-      player[0] += dx
-  if not circle_hits_wall(player[0], player[1] + dy, PLAYER_RADIUS):
-      player[1] += dy
+  """Move with swept substeps so movement cannot pass through a wall."""
+  distance = math.hypot(dx, dy)
+  steps = max(1, math.ceil(distance / max(1, PLAYER_RADIUS / 2)))
+  step_x, step_y = dx / steps, dy / steps
+  for _ in range(steps):
+    if not circle_hits_wall(player[0] + step_x, player[1], PLAYER_RADIUS):
+      player[0] += step_x
+    if not circle_hits_wall(player[0], player[1] + step_y, PLAYER_RADIUS):
+      player[1] += step_y
 
 
 def shoot():
@@ -897,6 +1028,41 @@ def shoot():
         return
 
 
+def update_enemies(dt):
+  """Move enemies slowly and let them fire visible, dodgeable projectiles."""
+  now = time.perf_counter()
+  for enemy in enemies:
+    ex, ey = enemy[0], enemy[1]
+    distance = math.hypot(player[0] - ex, player[1] - ey)
+    # Enemies stay put until the player enters their engagement range, then
+    # approach while keeping a little space from the player.
+    if health > 0 and 115 < distance <= ENEMY_AGGRO_RANGE:
+      move_x = (player[0] - ex) / max(distance, 1) * 24 * dt
+      move_y = (player[1] - ey) / max(distance, 1) * 24 * dt
+      if not circle_hits_wall(ex + move_x, ey, ENEMY_RADIUS):
+        enemy[0] += move_x
+      if not circle_hits_wall(enemy[0], ey + move_y, ENEMY_RADIUS):
+        enemy[1] += move_y
+
+    last_shot = enemy_shot_times.get(id(enemy), 0.0)
+    if health > 0 and distance < 520 and now - last_shot >= 2.2 and visible(ex, ey):
+      direction = math.atan2(player[1] - ey, player[0] - ex)
+      enemy_projectiles.append([ex, ey, math.cos(direction) * 125,
+                                math.sin(direction) * 125, 0.0])
+      enemy_shot_times[id(enemy)] = now
+
+  for projectile in enemy_projectiles[:]:
+    projectile[0] += projectile[2] * dt
+    projectile[1] += projectile[3] * dt
+    projectile[4] += dt
+    if (projectile[4] > 5 or blocked(projectile[0], projectile[1]) or
+        math.hypot(projectile[0] - player[0], projectile[1] - player[1]) < PLAYER_RADIUS + 7):
+      if math.hypot(projectile[0] - player[0], projectile[1] - player[1]) < PLAYER_RADIUS + 7 and health > 0:
+        add_damage_indicator(projectile[0], projectile[1])
+        globals()["health"] = max(0, health - 18)
+      enemy_projectiles.remove(projectile)
+
+
 def play_gun_sound(weapon):
   """Play a short synthesized firing sound without blocking the game loop."""
   def play():
@@ -929,7 +1095,7 @@ def mouse_look(event):
     # Use movement between consecutive events so reversing direction responds
     # immediately instead of waiting to cross the original center position.
     if abs(delta) > 1:
-      angle += delta * 0.00045
+      angle += delta * mouse_sensitivity
       recenter_mouse()
   last_mouse_x = center_x
 
@@ -1008,7 +1174,9 @@ def fire(*_):
 def handle_key_press(event):
   key = event.keysym.lower()
   keys.add(key)
-  if key == "r":
+  if key == "t" and not (settings_window is not None and settings_window.winfo_exists()):
+    show_settings()
+  elif key == "r":
     reload_weapon()
   elif key == "q":
     switch_weapon(-1)
@@ -1026,6 +1194,7 @@ def reset_level():
   global player, angle, health, score, level, bullets, shotgun_shells, respawn_at
   global MAP, MAP_SEED, pickup_cells
   global shotgun_unlocked, weapon_index, enemies, shotgun_pickup, game_over, last_shotgun_shot
+  global enemy_projectiles, enemy_shot_times
   if not network:
     # Use a fresh seed for each single-player restart so the level changes.
     level += 1
@@ -1040,6 +1209,8 @@ def reset_level():
   last_shotgun_shot = -0.5
   shotgun_unlocked, weapon_index = False, 0
   enemies = [] if network else create_singleplayer_enemies()
+  enemy_projectiles = []
+  enemy_shot_times = {}
   pickup_x, pickup_y = random.Random(MAP_SEED + 1).choice(pickup_cells)
   shotgun_pickup = [pickup_x * TILE + TILE / 2, pickup_y * TILE + TILE / 2]
   game_over = False
@@ -1079,10 +1250,20 @@ def end_button_click(event):
 
 def draw_graphics_backdrop(horizon):
   """Paint a richer atmospheric backdrop without external assets."""
-  # Solid backdrop regions avoid the horizontal scanline artifact caused by
-  # creating one Tk canvas line for every screen row.
-  canvas.create_rectangle(0, 0, WIDTH, horizon, fill="#18213c", outline="")
-  canvas.create_rectangle(0, horizon, WIDTH, HEIGHT, fill="#3f2d38", outline="")
+  # Layered gradients make the ceiling and floor feel deeper than two flat
+  # colors while keeping the canvas object count modest.
+  ceiling_colors = ("#10172b", "#141c33", "#18213c", "#202945")
+  floor_colors = ("#261e2b", "#302331", "#3f2d38", "#51333a")
+  band_height = max(1, horizon // len(ceiling_colors))
+  for index, color in enumerate(ceiling_colors):
+    canvas.create_rectangle(0, index * band_height, WIDTH,
+                            (index + 1) * band_height + 1,
+                            fill=color, outline="")
+  band_height = max(1, (HEIGHT - horizon) // len(floor_colors))
+  for index, color in enumerate(floor_colors):
+    canvas.create_rectangle(0, horizon + index * band_height, WIDTH,
+                            horizon + (index + 1) * band_height + 1,
+                            fill=color, outline="")
   # Stars, distant haze, and overhead light shafts give the map depth.
   for index in range(24):
     x = (index * 347 + MAP_SEED % 271) % max(1, WIDTH)
@@ -1093,6 +1274,21 @@ def draw_graphics_backdrop(horizon):
     canvas.create_polygon(x, horizon - 35, x + 70, horizon - 35,
                           x + 260, HEIGHT, x + 80, HEIGHT,
                           fill="#3b2935", outline="")
+  # Perspective floor seams add scale and depth to the otherwise flat floor.
+  # They are deliberately sparse so the raycaster remains responsive.
+  for row in range(1, 9):
+    depth = row / 8
+    y = horizon + int((HEIGHT - horizon) * depth * depth)
+    canvas.create_line(0, y, WIDTH, y, fill="#68434a", width=1)
+  for column in range(-8, 9):
+    bottom_x = WIDTH / 2 + column * WIDTH / 8
+    canvas.create_line(WIDTH / 2, horizon, bottom_x, HEIGHT,
+                       fill="#49313b", width=1)
+  # A subtle ceiling vanishing-point pattern balances the floor detail.
+  for row in range(1, 5):
+    depth = row / 5
+    y = horizon - int(horizon * depth * depth)
+    canvas.create_line(0, y, WIDTH, y, fill="#293452", width=1)
 
 
 def draw_sun(horizon, view_angle, fov, origin_x, origin_y):
@@ -1107,8 +1303,51 @@ def draw_sun(horizon, view_angle, fov, origin_x, origin_y):
   canvas.create_image(x, y, image=sun_image, anchor="center")
 
 
+def cast_wall_ray(origin_x, origin_y, ray_angle, max_distance=800):
+  """Trace a ray through the map grid using a stable DDA traversal."""
+  direction_x, direction_y = math.cos(ray_angle), math.sin(ray_angle)
+  cell_x, cell_y = int(origin_x // TILE), int(origin_y // TILE)
+  step_x = 1 if direction_x >= 0 else -1
+  step_y = 1 if direction_y >= 0 else -1
+  delta_x = abs(TILE / direction_x) if abs(direction_x) > 1e-12 else float("inf")
+  delta_y = abs(TILE / direction_y) if abs(direction_y) > 1e-12 else float("inf")
+  next_x = (((cell_x + 1) * TILE - origin_x) / direction_x
+            if direction_x > 0 else
+            ((cell_x * TILE - origin_x) / direction_x
+             if direction_x < 0 else float("inf")))
+  next_y = (((cell_y + 1) * TILE - origin_y) / direction_y
+            if direction_y > 0 else
+            ((cell_y * TILE - origin_y) / direction_y
+             if direction_y < 0 else float("inf")))
+  distance = 0.0
+  while distance <= max_distance:
+    if next_x < next_y:
+      cell_x += step_x
+      distance, next_x = next_x, next_x + delta_x
+    else:
+      cell_y += step_y
+      distance, next_y = next_y, next_y + delta_y
+    if (cell_y < 0 or cell_y >= len(MAP) or cell_x < 0 or
+        cell_x >= len(MAP[0]) or MAP[cell_y][cell_x] == "1"):
+      distance = max(0.001, min(distance, max_distance))
+      return (distance, origin_x + direction_x * distance,
+              origin_y + direction_y * distance)
+  return (max_distance, origin_x + direction_x * max_distance,
+          origin_y + direction_y * max_distance)
+
+
 def draw_vignette():
   """Keep the center of the view clean; aiming is intentionally unobstructed."""
+  # Tk Canvas has no alpha compositing for normal shapes, so use progressively
+  # darker edge bands instead of a translucent overlay.  The clear center
+  # preserves visibility while making the scene feel substantially richer.
+  edge = max(18, min(WIDTH, HEIGHT) // 12)
+  for index in range(5):
+    inset = index * edge // 5
+    shade = 18 + index * 5
+    color = "#%02x%02x%02x" % (shade // 2, shade // 2, shade)
+    canvas.create_rectangle(inset, inset, WIDTH - inset, HEIGHT - inset,
+                            outline=color, width=max(2, edge // 5))
 
 
 
@@ -1120,7 +1359,9 @@ def draw_world():
   roll = 0.06 if "1" in keys else -0.06 if "2" in keys else 0
   view_angle = angle - 0.04 if "1" in keys else angle + 0.04 if "2" in keys else angle
   horizon = HEIGHT // 2
-  fov = math.pi / 3
+  # Use a wide, standard 90-degree horizontal field of view.  Keep the
+  # projection scale tied to the FOV so walls retain their correct size.
+  fov = math.radians(90)
   origin_x, origin_y = view_origin()
   draw_graphics_backdrop(horizon)
   draw_sun(horizon, view_angle, fov, origin_x, origin_y)
@@ -1128,24 +1369,48 @@ def draw_world():
   for column in range(0, WIDTH, RENDER_COLUMN_STEP):
     column_horizon = horizon + int(roll * (column - WIDTH / 2))
     ray_angle = view_angle - fov / 2 + fov * (column + RENDER_COLUMN_STEP / 2) / WIDTH
-    distance = 1
-    while distance < 800:
-      rx = origin_x + math.cos(ray_angle) * distance
-      ry = origin_y + math.sin(ray_angle) * distance
-      if blocked(rx, ry):
-        break
-      # Sampling every few world units is much cheaper and is hidden by the
-      # wide wall bands at this resolution.
-      distance += 5
+    distance, hit_x, hit_y = cast_wall_ray(origin_x, origin_y, ray_angle)
     distance *= math.cos(ray_angle - view_angle)
-    wall_height = min(HEIGHT, int(42000 / max(distance, 1)))
-    shade = max(22, min(220, int(24500 / max(distance, 1))))
+    wall_height = min(HEIGHT, int(46080 / max(distance, 1)))
+    # Light the wall according to which face the ray strikes.  This gives
+    # corridors readable shape instead of making every wall equally bright.
+    face_light = 1.0 if abs(math.cos(ray_angle)) > abs(math.sin(ray_angle)) else 0.78
+    shade = max(22, min(220, int(24500 / max(distance, 1) * face_light)))
     # Use smooth distance lighting instead of artificial wall bands or stripes.
     warm = min(255, shade + 12)
     color = "#%02x%02x%02x" % (warm, int(shade * 0.56), int(shade * 0.38))
     canvas.create_rectangle(column, column_horizon - wall_height // 2,
       min(WIDTH, column + RENDER_COLUMN_STEP),
       column_horizon + wall_height // 2, fill=color, outline="")
+
+    # Procedural masonry texture: the hit position makes the pattern stay
+    # attached to the world while the player turns, instead of swimming with
+    # the screen.  Multiple scales of warm stone, mortar, and cracks give the
+    # walls considerably more depth without requiring external image assets.
+    tile_x, tile_y = int(hit_x // TILE), int(hit_y // TILE)
+    wall_u = int((hit_x if abs(math.cos(ray_angle)) > abs(math.sin(ray_angle))
+                  else hit_y) % TILE)
+    brick_row = int(distance // 22)
+    seed = (tile_x * 928371 + tile_y * 364479 + brick_row * 193939 + wall_u // 8) & 255
+    texture_shade = max(12, min(230, shade + (seed % 25) - 12))
+    texture_color = "#%02x%02x%02x" % (min(255, texture_shade + 16),
+                                        int(texture_shade * 0.60),
+                                        int(texture_shade * 0.43))
+    # One textured fill per band is considerably faster than drawing several
+    # mortar objects for every ray, while the deterministic variation keeps
+    # the masonry tied to the world instead of the screen.
+    canvas.create_rectangle(column, column_horizon - wall_height // 2 + 1,
+      min(WIDTH, column + RENDER_COLUMN_STEP),
+      column_horizon + wall_height // 2 - 1, fill=texture_color, outline="")
+    # A single inset highlight gives the stone a bevel without two extra
+    # canvas objects for every ray.
+    highlight = "#%02x%02x%02x" % (min(255, texture_shade + 28),
+                                   min(220, int(texture_shade * 0.70)),
+                                   min(180, int(texture_shade * 0.50)))
+    canvas.create_line(column, column_horizon - wall_height // 2 + 1,
+                       min(WIDTH, column + RENDER_COLUMN_STEP),
+                       column_horizon - wall_height // 2 + 1,
+                       fill=highlight, width=1)
 
   for ex, ey, _ in sorted(enemies, key=lambda e: -math.hypot(e[0] - player[0], e[1] - player[1])):
     dx, dy = ex - origin_x, ey - origin_y
@@ -1188,6 +1453,18 @@ def draw_world():
              fill="#fff06a", outline="")
       canvas.create_line(x - size // 5, y + size // 2, x + size // 5,
              y + size // 2, fill="#ff5360", width=max(1, size // 18))
+
+  # Enemy fireballs are drawn as bright world-space projectiles.
+  for projectile_x, projectile_y, _, _, _ in enemy_projectiles:
+    dx, dy = projectile_x - origin_x, projectile_y - origin_y
+    distance = math.hypot(dx, dy)
+    relative = (math.atan2(dy, dx) - view_angle + math.pi) % (2 * math.pi) - math.pi
+    if distance > 1 and abs(relative) < fov / 2 and visible(projectile_x, projectile_y):
+      x = int(WIDTH / 2 + math.tan(relative) * WIDTH / (2 * math.tan(fov / 2)))
+      size = max(4, int(2200 / distance))
+      y = horizon
+      canvas.create_oval(x - size, y - size, x + size, y + size,
+                         fill="#ff5722", outline="#ffe082", width=2)
 
   # Draw connected players as simple colored marine models.
   with network_lock:
@@ -1367,7 +1644,6 @@ def draw_world():
   canvas.create_text(14, HEIGHT - 14, anchor="sw", fill="#d8d8e8",
              font=("Consolas", 11),
              text="Q/E SWITCH   W/S MOVE   A/D STRAFE   SPACE FIRE   R RELOAD")
-  draw_vignette()
 
 
 def tick():
@@ -1384,6 +1660,9 @@ def tick():
   last_tick_time = now
   muzzle_flash = max(0.0, muzzle_flash - dt)
   pickup_bob += dt * 3
+  damage_indicators[:] = [[direction, remaining - dt]
+                          for direction, remaining in damage_indicators
+                          if remaining > dt]
   if network and health <= 0:
     if respawn_at is None:
       respawn_at = now + 2.0
@@ -1400,6 +1679,8 @@ def tick():
   if health > 0:
     move(math.cos(angle) * forward + math.cos(angle + math.pi / 2) * strafe,
        math.sin(angle) * forward + math.sin(angle + math.pi / 2) * strafe)
+  if not network and health > 0:
+    update_enemies(dt)
   send_network_state()
   if health > 0 and shotgun_pickup is not None and math.hypot(shotgun_pickup[0] - player[0], shotgun_pickup[1] - player[1]) < 32:
     shotgun_pickup = None
@@ -1409,8 +1690,10 @@ def tick():
   for enemy in enemies:
     if math.hypot(enemy[0] - player[0], enemy[1] - player[1]) < PLAYER_RADIUS + ENEMY_RADIUS + 18:
       if health > 0:
+        add_damage_indicator(enemy[0], enemy[1])
         health = max(0, health - 20 * dt)
   draw_world()
+  draw_damage_indicators()
   # Multiplayer is an ongoing deathmatch: the enemy list is intentionally
   # empty, so it must not trigger the single-player victory screen.
   if not network and (health <= 0 or not enemies):
