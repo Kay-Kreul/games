@@ -11,6 +11,7 @@ import ctypes
 import tkinter as tk
 import urllib.request
 import urllib.parse
+import urllib.error
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
@@ -58,6 +59,61 @@ DISCOVERY_PORT = 4712
 discovered_hosts = {}
 discovery_started = False
 app_running = True
+public_ip_cache = None
+public_ip_lock = threading.Lock()
+
+
+def get_local_ip():
+  """Return this computer's LAN address without requiring internet access."""
+  sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+  try:
+    sock.connect(("8.8.8.8", 80))
+    return sock.getsockname()[0]
+  except OSError:
+    return "127.0.0.1"
+  finally:
+    sock.close()
+
+
+def get_public_ip():
+  """Get the public IPv4 address players can use to join this host."""
+  global public_ip_cache
+  with public_ip_lock:
+    if public_ip_cache:
+      return public_ip_cache
+
+  def lookup(url):
+    try:
+      request = urllib.request.Request(url, headers={"User-Agent": "HOPE"})
+      with urllib.request.urlopen(request, timeout=3) as response:
+        address = response.read(64).decode().strip()
+      if address and all(part.isdigit() and 0 <= int(part) <= 255
+                         for part in address.split(".")) and address.count(".") == 3:
+        return address
+    except (OSError, ValueError, urllib.error.URLError):
+      return None
+    return None
+
+  # Try several providers concurrently; some networks block one or more of them.
+  endpoints = (
+      "https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com",
+      "https://ipv4.icanhazip.com", "http://checkip.amazonaws.com")
+  with ThreadPoolExecutor(max_workers=len(endpoints)) as pool:
+    futures = [pool.submit(lookup, endpoint) for endpoint in endpoints]
+    while futures:
+      for future in futures[:]:
+        if future.done():
+          futures.remove(future)
+          try:
+            address = future.result()
+          except Exception:
+            address = None
+          if address:
+            with public_ip_lock:
+              public_ip_cache = address
+            return address
+      time.sleep(0.02)
+  return None
 
 
 def scan_open_sockets():
@@ -115,8 +171,12 @@ def announce_host(port):
   sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
   try:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    public_ip = get_public_ip()
     while network:
-      sock.sendto(f"HOPE {username or 'Host'} {port}".encode(),
+      # Announce the public endpoint; local discovery still uses the packet's
+      # source address when a public address cannot be detected.
+      host_address = public_ip or username or "Host"
+      sock.sendto(f"HOPE {host_address} {port}".encode(),
                   ("<broadcast>", DISCOVERY_PORT))
       time.sleep(2)
   except OSError:
@@ -146,7 +206,7 @@ def open_internet_port(port):
              "MX: 1\r\n"
              "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n")
   sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-  sock.settimeout(2)
+  sock.settimeout(1)
   try:
     sock.sendto(message.encode(), ("239.255.255.250", 1900))
     response, _ = sock.recvfrom(4096)
@@ -155,7 +215,7 @@ def open_internet_port(port):
                      if line.lower().startswith("location:")), None)
     if not location:
       return None
-    description = urllib.request.urlopen(location, timeout=2).read()
+    description = urllib.request.urlopen(location, timeout=1.5).read()
     root_xml = ET.fromstring(description)
     namespace = {"u": "urn:schemas-upnp-org:device-1-0"}
     service = next((item for item in root_xml.findall(".//u:service", namespace)
@@ -176,7 +236,7 @@ def open_internet_port(port):
     request = urllib.request.Request(control, data=body.encode(), method="POST",
       headers={"Content-Type": "text/xml; charset=\"utf-8\"",
                "SOAPAction": '"urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping"'})
-    urllib.request.urlopen(request, timeout=3).read()
+    urllib.request.urlopen(request, timeout=1.5).read()
     return local_ip
   except (OSError, ValueError, urllib.error.URLError, ET.ParseError):
     return None
@@ -326,7 +386,9 @@ def start_network():
     port = int(sys.argv[3] if mode == "--join" and len(sys.argv) > 3 else
                sys.argv[2] if mode == "--host" and len(sys.argv) > 2 else 4711)
     if mode == "--host":
-      print(f"Hosting multiplayer on port {port}. Waiting for a player to join...")
+      public_ip = get_public_ip()
+      endpoint = f"{public_ip}:{port}" if public_ip else f"<public-ip>:{port}"
+      print(f"Hosting multiplayer at {endpoint}. Waiting for a player to join...")
       listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
       listener.bind(("0.0.0.0", port))
@@ -561,6 +623,13 @@ def show_start_menu():
   tk.Label(menu, text="Username").pack()
   username_entry = tk.Entry(menu, width=25)
   username_entry.pack(pady=2)
+  def autofill_username():
+    """Fill the username field with a unique default name."""
+    username_entry.delete(0, tk.END)
+    username_entry.insert(0, f"Player{random.SystemRandom().randint(1000, 9999)}")
+    username_entry.focus_set()
+
+  tk.Button(menu, text="Auto-fill username", command=autofill_username).pack(pady=2)
   username_error = tk.Label(menu, text="Username is required", fg="#b00020")
 
   def set_username():
@@ -605,6 +674,43 @@ def show_start_menu():
   port_entry = tk.Entry(menu, width=12)
   port_entry.insert(0, "4711")
   port_entry.pack(pady=2)
+
+  def autofill_host_connection():
+    """Fill host connection details with this computer's public address."""
+    mode.set("host")
+    port_entry.delete(0, tk.END)
+    port_entry.insert(0, "4711")
+    multiplayer_button.config(state="disabled", text="Finding public IP...")
+    lookup_result = [None, False]
+
+    def find_public_ip():
+      # Tkinter widgets must only be accessed from the main thread.  Store
+      # the result here; the main thread polls it below and updates the UI.
+      lookup_result[0] = get_public_ip()
+      lookup_result[1] = True
+
+    def update_fields():
+      if not menu.winfo_exists():
+        return
+      if not lookup_result[1]:
+        menu.after(100, update_fields)
+        return
+      public_ip = lookup_result[0]
+      host_entry.delete(0, tk.END)
+      host_entry.insert(0, public_ip or "Your public IP could not be found")
+      multiplayer_button.config(state="normal", text="Start Multiplayer")
+      quick_join_status.config(
+          text=("Give your friend the IP above and port 4711. "
+                "Allow TCP 4711 through your firewall/router."
+                if public_ip else
+                "Could not find your public IP; enter it manually."),
+          fg="#176b2c" if public_ip else "#b00020")
+
+    threading.Thread(target=find_public_ip, daemon=True).start()
+    menu.after(100, update_fields)
+
+  tk.Button(menu, text="Auto-fill Host IP + Port", width=30,
+            command=autofill_host_connection).pack(pady=2)
   multiplayer_button = tk.Button(menu, text="Start Multiplayer", width=30, height=2,
                                  command=multiplayer)
   multiplayer_button.pack(pady=6)
