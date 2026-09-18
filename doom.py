@@ -13,12 +13,15 @@ import tkinter as tk
 WIDTH, HEIGHT = 1280, 720
 
 TILE = 64
-MAP_SEED = 4711
+MAP_SEED = random.SystemRandom().randint(0, 2**31 - 1)
+PLAYER_RADIUS = 18
+ENEMY_RADIUS = 20
 player = [2.5 * TILE, 2.5 * TILE]
 angle = 0.0
 health = 100
 score = 0
-MAGAZINE_SIZE = 6
+MAGAZINE_SIZE = 8
+SHOTGUN_MAGAZINE_SIZE = 4
 bullets = MAGAZINE_SIZE
 shotgun_shells = 0
 shotgun_unlocked = False
@@ -177,6 +180,23 @@ def send_network_shot():
       pass
 
 
+def spawn_player():
+  """Choose a clear multiplayer spawn away from other players."""
+  global player
+  cells = [(x, y) for y, row in enumerate(MAP) for x, cell in enumerate(row)
+           if cell == "." and (x, y) not in {(2, 2), (3, 2), (2, 3)}]
+  randomizer = random.SystemRandom()
+  randomizer.shuffle(cells)
+  with network_lock:
+    occupied = list(remote_players.values())
+  for x, y in cells:
+    px, py = x * TILE + TILE / 2, y * TILE + TILE / 2
+    if all(math.hypot(px - other[0], py - other[1]) > 2 * PLAYER_RADIUS + 80
+           for other in occupied):
+      player = [px, py]
+      return
+
+
 def make_map():
   """Create a new random map, keeping a clear starting area and enemies."""
   # Every client must generate the exact same level layout.  Do not use the
@@ -317,9 +337,17 @@ def visible(x, y):
 
 
 def move(dx, dy):
-    if not blocked(player[0] + dx, player[1]):
+    if not any(blocked(player[0] + dx + ox, player[1] + oy)
+               for ox, oy in ((-PLAYER_RADIUS, -PLAYER_RADIUS),
+                              (PLAYER_RADIUS, -PLAYER_RADIUS),
+                              (-PLAYER_RADIUS, PLAYER_RADIUS),
+                              (PLAYER_RADIUS, PLAYER_RADIUS))):
       player[0] += dx
-    if not blocked(player[0], player[1] + dy):
+    if not any(blocked(player[0] + ox, player[1] + dy + oy)
+               for ox, oy in ((-PLAYER_RADIUS, -PLAYER_RADIUS),
+                              (PLAYER_RADIUS, -PLAYER_RADIUS),
+                              (-PLAYER_RADIUS, PLAYER_RADIUS),
+                              (PLAYER_RADIUS, PLAYER_RADIUS))):
       player[1] += dy
 
 
@@ -349,7 +377,8 @@ def shoot():
     dx, dy = enemy[0] - origin_x, enemy[1] - origin_y
     distance = math.hypot(dx, dy)
     difference = abs((math.atan2(dy, dx) - view_angle + math.pi) % (2 * math.pi) - math.pi)
-    if distance < 500 and difference < hit_angle and visible(enemy[0], enemy[1]):
+    if (PLAYER_RADIUS + ENEMY_RADIUS <= distance < 500 and
+      difference < hit_angle and visible(enemy[0], enemy[1])):
       actual_damage = damage
       if weapon_index == 1:
         actual_damage = max(5, int(damage * max(0.0, 1 - distance / 500)))
@@ -423,7 +452,7 @@ def reload_weapon():
   if weapon_index == 0:
     bullets = MAGAZINE_SIZE
   elif shotgun_unlocked:
-    shotgun_shells = 8
+    shotgun_shells = SHOTGUN_MAGAZINE_SIZE
 
 
 def switch_weapon(direction):
@@ -464,7 +493,15 @@ def close_game(event):
 
 def reset_level():
   global player, angle, health, score, bullets, shotgun_shells, respawn_at
+  global MAP, MAP_SEED, pickup_cells
   global shotgun_unlocked, weapon_index, enemies, shotgun_pickup, game_over, last_shotgun_shot
+  if not network:
+    # Use a fresh seed for each single-player restart so the level changes.
+    MAP_SEED = random.SystemRandom().randint(0, 2**31 - 1)
+    MAP = make_map()
+    pickup_cells = [(x, y) for y, row in enumerate(MAP) for x, cell in enumerate(row)
+                    if cell == "." and (x, y) not in {(2, 2), (3, 2), (2, 3)}
+                    and (x, y) not in {(int(ex), int(ey)) for ex, ey in ENEMY_STARTS}]
   player = [2.5 * TILE, 2.5 * TILE]
   angle, health, score = 0.0, 100, 0
   bullets, shotgun_shells = MAGAZINE_SIZE, 0
@@ -596,9 +633,15 @@ def draw_world():
       size = max(10, int(16000 / distance))
       y = horizon - size // 2
       canvas.create_oval(x - size // 4, y, x + size // 4, y + size // 2,
-                         fill="#4fa3d1", outline="#bcecff", width=2)
+             fill="#b9c9d3", outline="#efffff", width=2)
+      canvas.create_rectangle(x - size // 5, y + size // 8, x + size // 5,
+              y + size // 3, fill="#263d50", outline="#8de4ff")
       canvas.create_rectangle(x - size // 3, y + size // 2, x + size // 3,
-                              y + size, fill="#28709b", outline="#bcecff")
+              y + size, fill="#28709b", outline="#bcecff", width=2)
+      canvas.create_line(x - size // 6, y + size, x - size // 6, y + size * 6 // 5,
+             fill="#182b3a", width=max(3, size // 8))
+      canvas.create_line(x + size // 6, y + size, x + size // 6, y + size * 6 // 5,
+             fill="#182b3a", width=max(3, size // 8))
       canvas.create_line(x, y + size // 2, x + int(math.cos(remote_angle) * size),
                          y + size // 2 + int(math.sin(remote_angle) * size),
                          fill="#ffe08a", width=max(2, size // 10))
@@ -662,7 +705,7 @@ def draw_world():
              font=("Consolas", 17, "bold"),
              text=f"AMMO {ammo:02d}")
   # Render individual rounds so the ammo count looks like actual bullets.
-  bullet_count = MAGAZINE_SIZE if not weapon_index else 8
+  bullet_count = MAGAZINE_SIZE if not weapon_index else SHOTGUN_MAGAZINE_SIZE
   bullet_y = HEIGHT - 30
   for index in range(bullet_count):
     x = WIDTH - 24 - index * 24
@@ -689,6 +732,9 @@ def tick():
       respawn_at = now + 2.0
     if now >= respawn_at:
       respawn_player()
+  if network and health > 0 and not remote_players:
+    # Avoid the default spawn when both clients connect at once.
+    spawn_player()
   forward = (("w" in keys) - ("s" in keys)) * 165 * dt if health > 0 else 0
   # Smooth strafing so releasing or changing direction does not feel abrupt.
   target_strafe = (("d" in keys) - ("a" in keys)) * 110
@@ -700,7 +746,7 @@ def tick():
   if health > 0 and shotgun_pickup is not None and math.hypot(shotgun_pickup[0] - player[0], shotgun_pickup[1] - player[1]) < 32:
     shotgun_pickup = None
     shotgun_unlocked = True
-    shotgun_shells = 8
+    shotgun_shells = SHOTGUN_MAGAZINE_SIZE
     switch_weapon(1)
   for enemy in enemies:
     if math.hypot(enemy[0] - player[0], enemy[1] - player[1]) < 120:
