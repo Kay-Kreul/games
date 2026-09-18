@@ -31,6 +31,7 @@ remote_players = {}
 network_lock = threading.Lock()
 network_status = "SINGLEPLAYER"
 remote_health = {}
+respawn_at = None
 
 
 def network_loop(sock):
@@ -76,10 +77,12 @@ def network_loop(sock):
         try:
           state = (float(parts[2]), float(parts[3]),
                    float(parts[4]) if len(parts) > 4 else 0.0)
+          remote_player_health = float(parts[5]) if len(parts) > 5 else 100.0
         except ValueError:
           continue
         with network_lock:
           remote_players[parts[1]] = state
+          remote_health[parts[1]] = remote_player_health
     except socket.timeout:
       continue
     except OSError:
@@ -161,7 +164,7 @@ def select_game_mode():
 def send_network_state():
   if network:
     try:
-      network.sendall(f"P local {player[0]:.1f} {player[1]:.1f} {angle:.3f}\n".encode())
+      network.sendall(f"P local {player[0]:.1f} {player[1]:.1f} {angle:.3f} {health:.1f}\n".encode())
     except OSError:
       pass
 
@@ -460,7 +463,7 @@ def close_game(event):
 
 
 def reset_level():
-  global player, angle, health, score, bullets, shotgun_shells
+  global player, angle, health, score, bullets, shotgun_shells, respawn_at
   global shotgun_unlocked, weapon_index, enemies, shotgun_pickup, game_over, last_shotgun_shot
   player = [2.5 * TILE, 2.5 * TILE]
   angle, health, score = 0.0, 100, 0
@@ -471,8 +474,22 @@ def reset_level():
   pickup_x, pickup_y = random.Random(MAP_SEED + 1).choice(pickup_cells)
   shotgun_pickup = [pickup_x * TILE + TILE / 2, pickup_y * TILE + TILE / 2]
   game_over = False
+  respawn_at = None
   lock_mouse()
   tick()
+
+
+def respawn_player():
+  """Place a dead multiplayer player at a random clear map cell."""
+  global player, health, respawn_at
+  cells = [(x, y) for y, row in enumerate(MAP) for x, cell in enumerate(row)
+           if cell == "." and math.hypot(x * TILE + TILE / 2 - player[0],
+                                         y * TILE + TILE / 2 - player[1]) > 160]
+  if cells:
+    x, y = random.choice(cells)
+    player = [x * TILE + TILE / 2, y * TILE + TILE / 2]
+  health = 100
+  respawn_at = None
 
 
 def end_button_click(event):
@@ -558,6 +575,10 @@ def draw_world():
   with network_lock:
     other_players = list(remote_players.values())
   for px, py, remote_angle in other_players:
+    # Dead network players remain hidden until their respawn.
+    if remote_health.get(next((key for key, value in remote_players.items()
+                               if value == (px, py, remote_angle)), ""), 100) <= 0:
+      continue
     dx, dy = px - origin_x, py - origin_y
     distance = math.hypot(dx, dy)
     relative = (math.atan2(dy, dx) - view_angle + math.pi) % (2 * math.pi) - math.pi
@@ -648,13 +669,18 @@ def draw_world():
 
 
 def tick():
-  global health, angle, mouse_turn, muzzle_flash, shotgun_pickup, shotgun_shells, shotgun_unlocked, pickup_bob, last_tick_time, strafe_velocity, game_over, end_button
+  global health, angle, mouse_turn, muzzle_flash, shotgun_pickup, shotgun_shells, shotgun_unlocked, pickup_bob, last_tick_time, strafe_velocity, game_over, end_button, respawn_at
   now = time.perf_counter()
   dt = min(0.05, max(0.001, now - last_tick_time))
   last_tick_time = now
   muzzle_flash = max(0.0, muzzle_flash - dt)
   pickup_bob += dt * 3
-  forward = (("w" in keys) - ("s" in keys)) * 165 * dt
+  if network and health <= 0:
+    if respawn_at is None:
+      respawn_at = now + 2.0
+    if now >= respawn_at:
+      respawn_player()
+  forward = (("w" in keys) - ("s" in keys)) * 165 * dt if health > 0 else 0
   # Smooth strafing so releasing or changing direction does not feel abrupt.
   target_strafe = (("d" in keys) - ("a" in keys)) * 110
   strafe_velocity += (target_strafe - strafe_velocity) * (1 - math.exp(-12 * dt))
@@ -662,16 +688,17 @@ def tick():
   move(math.cos(angle) * forward + math.cos(angle + math.pi / 2) * strafe,
      math.sin(angle) * forward + math.sin(angle + math.pi / 2) * strafe)
   send_network_state()
-  if shotgun_pickup is not None and math.hypot(shotgun_pickup[0] - player[0], shotgun_pickup[1] - player[1]) < 32:
+  if health > 0 and shotgun_pickup is not None and math.hypot(shotgun_pickup[0] - player[0], shotgun_pickup[1] - player[1]) < 32:
     shotgun_pickup = None
     shotgun_unlocked = True
     shotgun_shells = 8
     switch_weapon(1)
   for enemy in enemies:
     if math.hypot(enemy[0] - player[0], enemy[1] - player[1]) < 120:
-      health = max(0, health - 20 * dt)
+      if health > 0:
+        health = max(0, health - 20 * dt)
   draw_world()
-  if not enemies or health <= 0:
+  if (not network and health <= 0) or not enemies:
     game_over = True
     unlock_mouse()
     label = "YOU WIN!" if not enemies else "YOU DIED"
