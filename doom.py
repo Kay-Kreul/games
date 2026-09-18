@@ -46,6 +46,7 @@ multiplayer_spawned = False
 DISCOVERY_PORT = 4712
 discovered_hosts = {}
 discovery_started = False
+app_running = True
 
 
 def discover_hosts():
@@ -261,6 +262,7 @@ def start_network():
       # when this packet is received by network_loop().
       if mode == "--host":
         network.sendall(f"M {MAP_SEED}\n".encode())
+        threading.Thread(target=announce_host, args=(port,), daemon=True).start()
       threading.Thread(target=network_loop, args=(network,), daemon=True).start()
   except (OSError, ValueError, IndexError, socket.timeout):
     print("Failed to connect; continuing in singleplayer mode.")
@@ -414,16 +416,18 @@ canvas.pack(fill="both", expand=True)
 
 def show_start_menu():
   """Choose the game mode in the game window before entering the map."""
+  start_host_discovery()
   menu = tk.Toplevel(root)
   menu.title("HOPE GAME MODE")
-  menu.geometry("380x260")
+  menu.geometry("520x520")
   menu.update_idletasks()
-  menu.geometry("+%d+%d" % ((menu.winfo_screenwidth() - 380) // 2,
-                            (menu.winfo_screenheight() - 260) // 2))
+  menu.geometry("+%d+%d" % ((menu.winfo_screenwidth() - 520) // 2,
+                            (menu.winfo_screenheight() - 520) // 2))
   menu.resizable(False, False)
   menu.transient(root)
   menu.grab_set()
-  tk.Label(menu, text="Choose a game mode", font=("Consolas", 16, "bold")).pack(pady=16)
+  menu.focus_force()
+  tk.Label(menu, text="Choose a game mode", font=("Consolas", 20, "bold")).pack(pady=18)
 
   tk.Label(menu, text="Username").pack()
   username_entry = tk.Entry(menu, width=25)
@@ -457,7 +461,7 @@ def show_start_menu():
     menu.destroy()
     start_network()
 
-  tk.Button(menu, text="Singleplayer", width=24, command=singleplayer).pack(pady=4)
+  tk.Button(menu, text="Singleplayer", width=30, height=2, command=singleplayer).pack(pady=5)
   mode = tk.StringVar(value="host")
   tk.Radiobutton(menu, text="Host", variable=mode, value="host").pack()
   tk.Radiobutton(menu, text="Join", variable=mode, value="join").pack()
@@ -466,16 +470,35 @@ def show_start_menu():
                                     else "Join Multiplayer"))
 
   mode.trace_add("write", update_multiplayer_button)
-  host_entry = tk.Entry(menu, width=25)
+  host_entry = tk.Entry(menu, width=32)
   host_entry.insert(0, "127.0.0.1")
   host_entry.pack(pady=2)
-  port_entry = tk.Entry(menu, width=10)
+  port_entry = tk.Entry(menu, width=12)
   port_entry.insert(0, "4711")
   port_entry.pack(pady=2)
-  multiplayer_button = tk.Button(menu, text="Start Multiplayer", width=24,
+  multiplayer_button = tk.Button(menu, text="Start Multiplayer", width=30, height=2,
                                  command=multiplayer)
-  multiplayer_button.pack(pady=4)
-  menu.protocol("WM_DELETE_WINDOW", singleplayer)
+  multiplayer_button.pack(pady=6)
+
+  quick_join_status = tk.Label(menu, text="Searching for nearby hosts...", fg="#555555")
+  quick_join_status.pack(pady=(10, 3))
+
+  def quick_join():
+    """Join the first host announced on the local network."""
+    if not discovered_hosts:
+      quick_join_status.config(text="No nearby hosts found; enter an address above.", fg="#b00020")
+      return
+    _, (host, port) = next(iter(discovered_hosts.items()))
+    if not set_username():
+      return
+    sys.argv[1:1] = ["--join", host, str(port)]
+    menu.destroy()
+    start_network()
+
+  tk.Button(menu, text="Quick Join", width=30, height=2, command=quick_join).pack(pady=4)
+  tk.Label(menu, text="Quick Join uses a host found on your local network.",
+           font=("Consolas", 9), fg="#666666").pack(pady=2)
+  menu.protocol("WM_DELETE_WINDOW", root.destroy)
   root.wait_window(menu)
 
 
@@ -675,6 +698,8 @@ def handle_key_press(event):
 
 
 def close_game(event):
+  global app_running
+  app_running = False
   event.widget.winfo_toplevel().destroy()
 
 
@@ -982,6 +1007,8 @@ def draw_world():
 
 def tick():
   global health, angle, mouse_turn, muzzle_flash, shotgun_pickup, shotgun_shells, shotgun_unlocked, pickup_bob, last_tick_time, strafe_velocity, game_over, end_button, respawn_at, multiplayer_spawned
+  if not app_running or not root.winfo_exists():
+    return
   now = time.perf_counter()
   dt = min(0.05, max(0.001, now - last_tick_time))
   last_tick_time = now
