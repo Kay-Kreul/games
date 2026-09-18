@@ -90,7 +90,7 @@ def start_host_discovery():
 
 def network_loop(sock):
   """Exchange small JSON-like text packets without affecting the render loop."""
-  global network_status, health, MAP_SEED, MAP, enemies, pickup_cells, shotgun_pickup
+  global network_status, health, score, MAP_SEED, MAP, enemies, pickup_cells, shotgun_pickup
   sock.settimeout(0.15)
   buffer = ""
   network_status = "MULTIPLAYER"
@@ -161,10 +161,12 @@ def network_loop(sock):
           if len(parts) >= 3:
             killer_id = parts[1]
             if killer_id == PLAYER_ID:
+              # The kill packet updates the killer immediately; the next
+              # position packet will also advertise this updated total.
               score += 100
             else:
-              # Update the remote leaderboard immediately; position packets
-              # also carry the killer's authoritative total.
+              # Update other players' leaderboards as soon as the death is
+              # received, without waiting for another position update.
               with network_lock:
                 remote_kills[killer_id] = remote_kills.get(killer_id, 0) + 1
           continue
@@ -483,10 +485,27 @@ def show_start_menu():
   quick_join_status = tk.Label(menu, text="Searching for nearby hosts...", fg="#555555")
   quick_join_status.pack(pady=(10, 3))
 
+  def refresh_quick_join_status():
+    """Keep the nearby-host list and Quick Join status current."""
+    if not menu.winfo_exists():
+      return
+    if discovered_hosts:
+      hosts = list(discovered_hosts.items())
+      host_name, (host, port) = hosts[0]
+      quick_join_status.config(
+          text=f"{len(hosts)} host(s) found; ready to join {host_name} ({host}:{port})",
+          fg="#176b2c")
+      quick_join_button.config(state="normal")
+    else:
+      quick_join_status.config(text="Searching for nearby hosts...", fg="#555555")
+      quick_join_button.config(state="disabled")
+    menu.after(1000, refresh_quick_join_status)
+
   def quick_join():
     """Join the first host announced on the local network."""
     if not discovered_hosts:
-      quick_join_status.config(text="No nearby hosts found; enter an address above.", fg="#b00020")
+      quick_join_status.config(text="No nearby hosts found; keep waiting or enter an address above.",
+                               fg="#b00020")
       return
     _, (host, port) = next(iter(discovered_hosts.items()))
     if not set_username():
@@ -495,7 +514,10 @@ def show_start_menu():
     menu.destroy()
     start_network()
 
-  tk.Button(menu, text="Quick Join", width=30, height=2, command=quick_join).pack(pady=4)
+  quick_join_button = tk.Button(menu, text="Quick Join", width=30, height=2,
+                                command=quick_join, state="disabled")
+  quick_join_button.pack(pady=4)
+  refresh_quick_join_status()
   tk.Label(menu, text="Quick Join uses a host found on your local network.",
            font=("Consolas", 9), fg="#666666").pack(pady=2)
   menu.protocol("WM_DELETE_WINDOW", root.destroy)
@@ -839,11 +861,11 @@ def draw_world():
 
   # Draw connected players as simple colored marine models.
   with network_lock:
-    other_players = list(remote_players.values())
-  for px, py, remote_angle in other_players:
-    # Dead network players remain hidden until their respawn.
-    if remote_health.get(next((key for key, value in remote_players.items()
-                               if value == (px, py, remote_angle)), ""), 100) <= 0:
+    other_players = [(player_id, state, remote_health.get(player_id, 100))
+                     for player_id, state in remote_players.items()]
+  for _, (px, py, remote_angle), player_health in other_players:
+    # Dead network players remain hidden until their respawn packet arrives.
+    if player_health <= 0:
       continue
     dx, dy = px - origin_x, py - origin_y
     distance = math.hypot(dx, dy)
