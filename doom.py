@@ -37,9 +37,12 @@ network_lock = threading.Lock()
 network_status = "SINGLEPLAYER"
 remote_health = {}
 remote_kills = {}
+remote_names = {}
 respawn_at = None
 PLAYER_ID = f"p{random.SystemRandom().randint(0, 2**31 - 1):08x}"
 network_peer_ids = {}
+username = "PLAYER"
+multiplayer_spawned = False
 
 
 def network_loop(sock):
@@ -58,11 +61,11 @@ def network_loop(sock):
       buffer = lines.pop()
       for line in lines:
         parts = line.split()
-        if not parts or parts[0] not in ("P", "S", "M"):
+        if not parts or parts[0] not in ("P", "S", "M", "K"):
           continue
         # The host relays state and shots so clients that join after the game
         # has started can still see and damage the other players.
-        if parts[0] in ("P", "S"):
+        if parts[0] in ("P", "S", "K"):
           with network_peers_lock:
             peers = list(network_peers)
           for peer in peers:
@@ -106,7 +109,14 @@ def network_loop(sock):
                              (2 * math.pi) - math.pi)
             if visible(player[0], player[1]) and difference < (0.45 if weapon else 0.08):
               damage = 12 if not weapon else max(5, int(50 * max(0.0, 1 - distance / 500)))
+              was_alive = health > 0
               health = max(0, health - damage)
+              if was_alive and health <= 0:
+                send_network_kill(parts[1])
+          continue
+        if parts[0] == "K":
+          if len(parts) >= 2 and parts[1] == PLAYER_ID:
+            score += 100
           continue
         if len(parts) < 4:
           continue
@@ -115,6 +125,7 @@ def network_loop(sock):
                    float(parts[4]) if len(parts) > 4 else 0.0)
           remote_player_health = float(parts[5]) if len(parts) > 5 else 100.0
           remote_player_kills = int(float(parts[6])) if len(parts) > 6 else 0
+          remote_username = parts[7][:16] if len(parts) > 7 else parts[1]
         except ValueError:
           continue
         with network_lock:
@@ -122,6 +133,7 @@ def network_loop(sock):
           remote_players[parts[1]] = state
           remote_health[parts[1]] = remote_player_health
           remote_kills[parts[1]] = remote_player_kills
+          remote_names[parts[1]] = remote_username
     except socket.timeout:
       continue
     except OSError:
@@ -138,6 +150,7 @@ def network_loop(sock):
       remote_players.pop(player_id, None)
       remote_health.pop(player_id, None)
       remote_kills.pop(player_id, None)
+      remote_names.pop(player_id, None)
 
 
 def accept_late_players(listener):
@@ -243,7 +256,7 @@ def select_game_mode():
 def send_network_state():
   if network:
     try:
-      packet = f"P {PLAYER_ID} {player[0]:.1f} {player[1]:.1f} {angle:.3f} {health:.1f} {score // 100}\n".encode()
+      packet = f"P {PLAYER_ID} {player[0]:.1f} {player[1]:.1f} {angle:.3f} {health:.1f} {score // 100} {username}\n".encode()
       with network_peers_lock:
         peers = list(network_peers)
       for peer in peers:
@@ -256,6 +269,18 @@ def send_network_shot():
   if network:
     try:
       packet = f"S {PLAYER_ID} {angle:.3f} {weapon_index}\n".encode()
+      with network_peers_lock:
+        peers = list(network_peers)
+      for peer in peers:
+        peer.sendall(packet)
+    except OSError:
+      pass
+
+
+def send_network_kill(victim_id):
+  if network:
+    try:
+      packet = f"K {victim_id}\n".encode()
       with network_peers_lock:
         peers = list(network_peers)
       for peer in peers:
@@ -351,10 +376,19 @@ def show_start_menu():
   menu.grab_set()
   tk.Label(menu, text="Choose a game mode", font=("Consolas", 16, "bold")).pack(pady=16)
 
+  tk.Label(menu, text="Username").pack()
+  username_entry = tk.Entry(menu, width=25)
+  username_entry.insert(0, username)
+  username_entry.pack(pady=2)
+
   def singleplayer():
+    global username
+    username = username_entry.get().strip()[:16] or "PLAYER"
     menu.destroy()
 
   def multiplayer():
+    global username
+    username = username_entry.get().strip()[:16] or "PLAYER"
     port = port_entry.get().strip() or "4711"
     if mode.get() == "host":
       sys.argv[1:1] = ["--host", port]
@@ -794,7 +828,9 @@ def draw_world():
 
   # Kills leaderboard in the upper-left corner.
   with network_lock:
-    standings = [("YOU", score // 100)] + list(remote_kills.items())
+    standings = [(username, score // 100)] + [
+      (remote_names.get(player_id, player_id), kills)
+      for player_id, kills in remote_kills.items()]
   standings.sort(key=lambda item: (-item[1], item[0]))
   board_x, board_y = 12, 44
   board_width = 190
@@ -885,7 +921,7 @@ def draw_world():
 
 
 def tick():
-  global health, angle, mouse_turn, muzzle_flash, shotgun_pickup, shotgun_shells, shotgun_unlocked, pickup_bob, last_tick_time, strafe_velocity, game_over, end_button, respawn_at
+  global health, angle, mouse_turn, muzzle_flash, shotgun_pickup, shotgun_shells, shotgun_unlocked, pickup_bob, last_tick_time, strafe_velocity, game_over, end_button, respawn_at, multiplayer_spawned
   now = time.perf_counter()
   dt = min(0.05, max(0.001, now - last_tick_time))
   last_tick_time = now
@@ -896,9 +932,9 @@ def tick():
       respawn_at = now + 2.0
     if now >= respawn_at:
       respawn_player()
-  if network and health > 0 and not remote_players:
-    # Avoid the default spawn when both clients connect at once.
+  if network and health > 0 and not multiplayer_spawned:
     spawn_player()
+    multiplayer_spawned = True
   forward = (("w" in keys) - ("s" in keys)) * 165 * dt if health > 0 else 0
   # Smooth strafing so releasing or changing direction does not feel abrupt.
   target_strafe = (("d" in keys) - ("a" in keys)) * 110
