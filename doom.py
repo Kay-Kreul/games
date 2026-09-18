@@ -29,6 +29,7 @@ network = None
 remote_players = {}
 network_lock = threading.Lock()
 network_status = "SINGLEPLAYER"
+remote_health = {}
 
 
 def network_loop(sock):
@@ -47,7 +48,29 @@ def network_loop(sock):
       buffer = lines.pop()
       for line in lines:
         parts = line.split()
-        if len(parts) < 4 or parts[0] != "P":
+        if not parts or parts[0] not in ("P", "S"):
+          continue
+        if parts[0] == "S":
+          if len(parts) < 4:
+            continue
+          try:
+            shooter_angle = float(parts[2])
+            weapon = int(parts[3])
+          except ValueError:
+            continue
+          # The sender's latest position is used to validate a shot locally.
+          with network_lock:
+            shooter = remote_players.get(parts[1])
+          if shooter is not None:
+            dx, dy = player[0] - shooter[0], player[1] - shooter[1]
+            distance = math.hypot(dx, dy)
+            difference = abs((math.atan2(dy, dx) - shooter_angle + math.pi) %
+                             (2 * math.pi) - math.pi)
+            if visible(player[0], player[1]) and difference < (0.45 if weapon else 0.08):
+              damage = 12 if not weapon else max(5, int(50 * max(0.0, 1 - distance / 500)))
+              health = max(0, health - damage)
+          continue
+        if len(parts) < 4:
           continue
         try:
           state = (float(parts[2]), float(parts[3]),
@@ -138,6 +161,14 @@ def send_network_state():
   if network:
     try:
       network.sendall(f"P local {player[0]:.1f} {player[1]:.1f} {angle:.3f}\n".encode())
+    except OSError:
+      pass
+
+
+def send_network_shot():
+  if network:
+    try:
+      network.sendall(f"S local {angle:.3f} {weapon_index}\n".encode())
     except OSError:
       pass
 
@@ -289,7 +320,7 @@ def shoot():
     if bullets <= 0:
       return
     bullets -= 1
-    damage = 2
+    damage = 12
     # Pistols only hit targets directly beneath the crosshair.
     hit_angle = 0.01
   else:
@@ -300,7 +331,7 @@ def shoot():
       return
     last_shotgun_shot = now
     shotgun_shells -= 1
-    damage = 2
+    damage = 50
     hit_angle = 0.45
   # A hit is an enemy close to the crosshair and in front of the player.
   view_angle = angle - 0.08 if "1" in keys else angle + 0.08 if "2" in keys else angle
@@ -310,7 +341,10 @@ def shoot():
     distance = math.hypot(dx, dy)
     difference = abs((math.atan2(dy, dx) - view_angle + math.pi) % (2 * math.pi) - math.pi)
     if distance < 500 and difference < hit_angle and visible(enemy[0], enemy[1]):
-      enemy[2] -= damage
+      actual_damage = damage
+      if weapon_index == 1:
+        actual_damage = max(5, int(damage * max(0.0, 1 - distance / 500)))
+      enemy[2] -= actual_damage
       if enemy[2] <= 0:
         enemies.remove(enemy)
         score += 100
@@ -401,6 +435,7 @@ def fire(*_):
   shoot()
   if (bullets, shotgun_shells) != ammo_before:
     muzzle_flash = 0.12
+    send_network_shot()
 
 
 def handle_key_press(event):
