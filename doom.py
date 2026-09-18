@@ -13,6 +13,7 @@ import tkinter as tk
 WIDTH, HEIGHT = 1280, 720
 
 TILE = 64
+MAP_SEED = 4711
 player = [2.5 * TILE, 2.5 * TILE]
 angle = 0.0
 health = 100
@@ -175,6 +176,9 @@ def send_network_shot():
 
 def make_map():
   """Create a new random map, keeping a clear starting area and enemies."""
+  # Every client must generate the exact same level layout.  Do not use the
+  # process-global RNG here because its state can differ between players.
+  map_random = random.Random(MAP_SEED)
   width, height = 16, 11
   protected = {(x, y) for x, y in [(2, 2), (3, 2), (2, 3)]}
   protected.update((int(x), int(y)) for x, y in ENEMY_STARTS)
@@ -184,7 +188,7 @@ def make_map():
     for x in range(width):
       wall = x in (0, width - 1) or y in (0, height - 1)
       if not wall and (x, y) not in protected:
-        wall = random.random() < 0.18
+        wall = map_random.random() < 0.18
       row.append("1" if wall else ".")
     rows.append("".join(row))
   # Keep the initial routes and enemy cells usable on every generated map.
@@ -198,7 +202,9 @@ enemies = [[x * TILE, y * TILE, 2] for x, y in ENEMY_STARTS]
 pickup_cells = [(x, y) for y, row in enumerate(MAP) for x, cell in enumerate(row)
                 if cell == "." and (x, y) not in {(2, 2), (3, 2), (2, 3)}
                 and (x, y) not in {(int(ex), int(ey)) for ex, ey in ENEMY_STARTS}]
-pickup_x, pickup_y = random.choice(pickup_cells)
+# Use a separate deterministic choice so both clients place the item alike,
+# regardless of any other random calls made during the game.
+pickup_x, pickup_y = random.Random(MAP_SEED + 1).choice(pickup_cells)
 shotgun_pickup = [pickup_x * TILE + TILE / 2, pickup_y * TILE + TILE / 2]
 game_over = False
 end_button = None
@@ -462,7 +468,7 @@ def reset_level():
   last_shotgun_shot = -0.5
   shotgun_unlocked, weapon_index = False, 0
   enemies = [[x * TILE, y * TILE, 2] for x, y in ENEMY_STARTS]
-  pickup_x, pickup_y = random.choice(pickup_cells)
+  pickup_x, pickup_y = random.Random(MAP_SEED + 1).choice(pickup_cells)
   shotgun_pickup = [pickup_x * TILE + TILE / 2, pickup_y * TILE + TILE / 2]
   game_over = False
   lock_mouse()
