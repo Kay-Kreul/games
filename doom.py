@@ -492,6 +492,15 @@ def respawn_player():
   respawn_at = None
 
 
+def retry_level():
+  """Respawn the player at a random clear location after dying."""
+  global game_over
+  respawn_player()
+  game_over = False
+  lock_mouse()
+  tick()
+
+
 def end_button_click(event):
   if end_button is not None:
     x1, y1, x2, y2, command = end_button
@@ -708,7 +717,7 @@ def tick():
     x1, y1, x2, y2 = WIDTH // 2 - 110, HEIGHT // 2 + 45, WIDTH // 2 + 110, HEIGHT // 2 + 90
     canvas.create_rectangle(x1, y1, x2, y2, fill="#263b5c", outline="#ffe45c", width=2)
     canvas.create_text(WIDTH // 2, (y1 + y2) // 2, text=button, fill="white", font=("Consolas", 16, "bold"))
-    end_button = (x1, y1, x2, y2, reset_level)
+    end_button = (x1, y1, x2, y2, reset_level if not enemies else retry_level)
   else:
     # Pace frames from the actual render time instead of accumulating timer drift.
     root.after(8, tick)
