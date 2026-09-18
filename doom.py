@@ -9,6 +9,10 @@ import threading
 import time
 import ctypes
 import tkinter as tk
+try:
+  import winsound
+except ImportError:
+  winsound = None
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -296,11 +300,20 @@ def network_loop(sock):
           try:
             shooter_angle = float(parts[2])
             weapon = int(parts[3])
+            # Carry the shooter's health with the shot.  A shot can remain
+            # queued while a death position packet is in flight; validating
+            # only the last replicated position would let a dead player fire.
+            shooter_packet_health = float(parts[4]) if len(parts) > 4 else 100.0
           except ValueError:
             continue
           # The sender's latest position is used to validate a shot locally.
           with network_lock:
             shooter = remote_players.get(parts[1])
+            shooter_health = remote_health.get(parts[1], 100)
+          # A dead player must not be able to damage anyone, even if a shot
+          # packet was already queued when the player died.
+          if shooter_health <= 0 or shooter_packet_health <= 0:
+            continue
           if shooter is not None:
             dx, dy = player[0] - shooter[0], player[1] - shooter[1]
             distance = math.hypot(dx, dy)
@@ -485,9 +498,9 @@ def send_network_state():
 
 
 def send_network_shot():
-  if network:
+  if network and health > 0:
     try:
-      packet = f"S {PLAYER_ID} {angle:.3f} {weapon_index}\n".encode()
+      packet = f"S {PLAYER_ID} {angle:.3f} {weapon_index} {health:.1f}\n".encode()
       with network_peers_lock:
         peers = list(network_peers)
       for peer in peers:
@@ -579,6 +592,7 @@ mouse_locked = False
 look_velocity = 0.0
 mouse_turn = 0.0
 muzzle_flash = 0.0
+damage_indicators = []
 pickup_bob = 0.0
 gunshot_audio = None
 last_tick_time = time.perf_counter()
@@ -811,6 +825,30 @@ def visible(x, y):
   return True
 
 
+def add_damage_indicator(source_x, source_y):
+  """Queue a brief indicator pointing from the attacker toward the player."""
+  direction = math.atan2(player[1] - source_y, player[0] - source_x)
+  damage_indicators.append([direction, 0.7])
+
+
+def draw_damage_indicators():
+  """Draw red arrows around the screen edge toward incoming damage."""
+  center_x, center_y = WIDTH / 2, HEIGHT / 2
+  radius = min(WIDTH, HEIGHT) * 0.38
+  for direction, remaining in damage_indicators:
+    relative = (direction - angle + math.pi) % (2 * math.pi) - math.pi
+    x = center_x + math.cos(relative) * radius
+    y = center_y + math.sin(relative) * radius
+    tip = (x + math.cos(relative) * 28, y + math.sin(relative) * 28)
+    side = relative + math.pi / 2
+    left = (x + math.cos(side) * 13, y + math.sin(side) * 13)
+    right = (x - math.cos(side) * 13, y - math.sin(side) * 13)
+    intensity = max(0.35, remaining / 0.7)
+    red = int(255 * intensity)
+    canvas.create_polygon(tip, left, right, fill="#%02x3030" % red,
+                          outline="#ffb0b0", width=2)
+
+
 def move(dx, dy):
   if not circle_hits_wall(player[0] + dx, player[1], PLAYER_RADIUS):
       player[0] += dx
@@ -857,6 +895,27 @@ def shoot():
         score += 100
       if weapon_index == 0:
         return
+
+
+def play_gun_sound(weapon):
+  """Play a short synthesized firing sound without blocking the game loop."""
+  def play():
+    if winsound is None:
+      try:
+        root.bell()
+      except tk.TclError:
+        pass
+      return
+    try:
+      if weapon:
+        winsound.Beep(95, 90)
+        winsound.Beep(65, 75)
+      else:
+        winsound.Beep(180, 45)
+        winsound.Beep(120, 35)
+    except (RuntimeError, OSError):
+      pass
+  threading.Thread(target=play, daemon=True).start()
 
 
 def mouse_look(event):
@@ -936,12 +995,13 @@ def switch_weapon(direction):
 def fire(*_):
   """Fire from mouse or keyboard input."""
   global muzzle_flash
-  if game_over:
+  if game_over or health <= 0:
     return
   ammo_before = (bullets, shotgun_shells)
   shoot()
   if (bullets, shotgun_shells) != ammo_before:
     muzzle_flash = 0.12
+    play_gun_sound(weapon_index)
     send_network_shot()
 
 
@@ -1049,6 +1109,7 @@ def draw_sun(horizon, view_angle, fov, origin_x, origin_y):
 
 def draw_vignette():
   """Keep the center of the view clean; aiming is intentionally unobstructed."""
+
 
 
 def draw_world():
