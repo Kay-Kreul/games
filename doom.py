@@ -9,6 +9,7 @@ import threading
 import time
 import ctypes
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
 
 WIDTH, HEIGHT = 1280, 720
 
@@ -49,6 +50,39 @@ discovery_started = False
 app_running = True
 
 
+def scan_open_sockets():
+  """Find reachable Hope hosts when UDP discovery is unavailable."""
+  try:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.connect(("8.8.8.8", 80))
+    local_ip = probe.getsockname()[0]
+    probe.close()
+    prefix = ".".join(local_ip.split(".")[:3])
+  except OSError:
+    prefix = "127.0.0"
+  addresses = {"127.0.0.1"}
+  addresses.update(f"{prefix}.{number}" for number in range(1, 255))
+
+  def check(target):
+    address, port = target
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.2)
+    try:
+      sock.connect((address, port))
+      return address, port
+    except OSError:
+      return None
+    finally:
+      sock.close()
+
+  targets = ((address, port) for address in addresses for port in range(4711, 4721))
+  with ThreadPoolExecutor(max_workers=64) as pool:
+    for result in pool.map(check, targets):
+      if result:
+        address, port = result
+        discovered_hosts[f"{address}:{port}"] = (address, str(port))
+
+
 def discover_hosts():
   """Listen for nearby Hope host announcements."""
   sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -86,6 +120,7 @@ def start_host_discovery():
   if not discovery_started:
     discovery_started = True
     threading.Thread(target=discover_hosts, daemon=True).start()
+    threading.Thread(target=scan_open_sockets, daemon=True).start()
 
 
 def network_loop(sock):
@@ -779,6 +814,45 @@ def end_button_click(event):
       command()
 
 
+def draw_graphics_backdrop(horizon):
+  """Paint a richer atmospheric backdrop without external assets."""
+  # Deep color gradients for a less flat, more dramatic scene.
+  for y in range(horizon):
+    t = y / max(1, horizon)
+    r, g, b = int(7 + 18 * t), int(10 + 17 * t), int(25 + 35 * t)
+    canvas.create_line(0, y, WIDTH, y, fill="#%02x%02x%02x" % (r, g, b))
+  for y in range(horizon, HEIGHT):
+    t = (y - horizon) / max(1, HEIGHT - horizon)
+    r, g, b = int(25 + 38 * t), int(20 + 25 * t), int(28 + 22 * t)
+    canvas.create_line(0, y, WIDTH, y, fill="#%02x%02x%02x" % (r, g, b))
+  # Stars, distant haze, and overhead light shafts give the map depth.
+  for index in range(34):
+    x = (index * 347 + MAP_SEED % 271) % max(1, WIDTH)
+    y = 25 + (index * 53 + MAP_SEED % 97) % max(30, horizon - 45)
+    size = 1 + index % 2
+    canvas.create_oval(x, y, x + size, y + size, fill="#7786ad", outline="")
+  for x in range(-WIDTH, WIDTH * 2, 150):
+    canvas.create_polygon(x, horizon - 35, x + 70, horizon - 35,
+                          x + 260, HEIGHT, x + 80, HEIGHT,
+                          fill="#3b2935", outline="")
+  canvas.create_oval(WIDTH // 2 - 72, horizon - 170, WIDTH // 2 + 72,
+                     horizon - 26, fill="#493447", outline="")
+
+
+def draw_vignette():
+  """Add subtle screen edges and a cinematic crosshair."""
+  edge = 90
+  for i in range(5):
+    alpha = 5 + i * 4
+    color = "#%02x%02x%02x" % (alpha, alpha, alpha + 5)
+    canvas.create_rectangle(i * edge // 5, i * edge // 5,
+                            WIDTH - i * edge // 5, HEIGHT - i * edge // 5,
+                            outline=color, width=2)
+  canvas.create_oval(WIDTH // 2 - 15, HEIGHT // 2 - 15,
+                     WIDTH // 2 + 15, HEIGHT // 2 + 15,
+                     outline="#a9d6d0", width=1)
+
+
 def draw_world():
   global end_button
   end_button = None
@@ -787,17 +861,7 @@ def draw_world():
   roll = 0.06 if "1" in keys else -0.06 if "2" in keys else 0
   view_angle = angle - 0.04 if "1" in keys else angle + 0.04 if "2" in keys else angle
   horizon = HEIGHT // 2
-  canvas.create_rectangle(0, 0, WIDTH, horizon, fill="#101525", outline="")
-  canvas.create_rectangle(0, horizon, WIDTH, HEIGHT, fill="#30252b", outline="")
-  # Layered sky and floor bands add depth without external assets.
-  for y in range(0, horizon, 18):
-    shade = min(46, 18 + y // 14)
-    canvas.create_rectangle(0, y, WIDTH, y + 18,
-                            fill="#%02x%02x%02x" % (shade // 2, shade // 2, shade), outline="")
-  for y in range(horizon, HEIGHT, 24):
-    shade = min(64, 38 + (y - horizon) // 12)
-    canvas.create_rectangle(0, y, WIDTH, y + 24,
-                            fill="#%02x%02x%02x" % (shade, shade // 2, shade // 2), outline="")
+  draw_graphics_backdrop(horizon)
   fov = math.pi / 3
   origin_x, origin_y = view_origin()
   for column in range(0, WIDTH, 2):
@@ -812,10 +876,20 @@ def draw_world():
       distance += 2
     distance *= math.cos(ray_angle - view_angle)
     wall_height = min(HEIGHT, int(42000 / max(distance, 1)))
-    shade = max(25, min(210, int(22000 / max(distance, 1))))
-    color = "#%02x%02x%02x" % (shade, shade // 2, shade // 3)
+    shade = max(22, min(220, int(24500 / max(distance, 1))))
+    # Alternating bands suggest masonry panels and make walls read as 3-D.
+    band = (int(distance // 18) + column // 28) % 3
+    color = ("#%02x%02x%02x" % (shade, shade // 2, shade // 3) if band else
+             "#%02x%02x%02x" % (min(255, shade + 18), shade // 2, shade // 4))
     canvas.create_rectangle(column, column_horizon - wall_height // 2, column + 2,
           column_horizon + wall_height // 2, fill=color, outline="")
+
+  # Floor perspective grid: inexpensive geometry with a strong visual payoff.
+  for depth in range(1, 14):
+    y = horizon + int((HEIGHT - horizon) * (depth / 14) ** 1.7)
+    canvas.create_line(0, y, WIDTH, y, fill="#49343c", width=1)
+  for grid_x in range(-WIDTH, WIDTH * 2, 96):
+    canvas.create_line(WIDTH // 2, horizon, grid_x, HEIGHT, fill="#3b2c35", width=1)
 
   for ex, ey, _ in sorted(enemies, key=lambda e: -math.hypot(e[0] - player[0], e[1] - player[1])):
     dx, dy = ex - origin_x, ey - origin_y
@@ -1025,11 +1099,17 @@ def draw_world():
   canvas.create_text(14, HEIGHT - 14, anchor="sw", fill="#d8d8e8",
              font=("Consolas", 11),
              text="Q/E SWITCH   W/S MOVE   A/D STRAFE   SPACE FIRE   R RELOAD")
+  draw_vignette()
 
 
 def tick():
   global health, angle, mouse_turn, muzzle_flash, shotgun_pickup, shotgun_shells, shotgun_unlocked, pickup_bob, last_tick_time, strafe_velocity, game_over, end_button, respawn_at, multiplayer_spawned
-  if not app_running or not root.winfo_exists():
+  if not app_running:
+    return
+  try:
+    if not root.winfo_exists():
+      return
+  except tk.TclError:
     return
   now = time.perf_counter()
   dt = min(0.05, max(0.001, now - last_tick_time))
