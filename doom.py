@@ -2,21 +2,13 @@
 Run with: python doom.py
 """
 import math
-import io
 import random
 import socket
-import struct
 import sys
 import threading
 import time
+import ctypes
 import tkinter as tk
-import wave
-
-ctypes = None
-winsound = None
-if sys.platform == "win32":
-  import ctypes
-  import winsound
 
 WIDTH, HEIGHT = 1280, 720
 
@@ -29,6 +21,7 @@ MAGAZINE_SIZE = 6
 bullets = MAGAZINE_SIZE
 shotgun_shells = 0
 shotgun_unlocked = False
+last_shotgun_shot = -0.5
 weapons = ("PISTOL", "SHOTGUN")
 weapon_index = 0
 ENEMY_STARTS = [(8.5, 3.5), (12.5, 7.5), (5.5, 8.5)]
@@ -154,6 +147,8 @@ pickup_cells = [(x, y) for y, row in enumerate(MAP) for x, cell in enumerate(row
                 and (x, y) not in {(int(ex), int(ey)) for ex, ey in ENEMY_STARTS}]
 pickup_x, pickup_y = random.choice(pickup_cells)
 shotgun_pickup = [pickup_x * TILE + TILE / 2, pickup_y * TILE + TILE / 2]
+game_over = False
+end_button = None
 keys = set()
 last_mouse_x = None
 mouse_locked = False
@@ -164,7 +159,6 @@ pickup_bob = 0.0
 gunshot_audio = None
 last_tick_time = time.perf_counter()
 strafe_velocity = 0.0
-select_game_mode()
 root = tk.Tk()
 
 root.title("DOOM: The Python Experiment")
@@ -176,6 +170,46 @@ WIDTH, HEIGHT = root.winfo_screenwidth(), root.winfo_screenheight()
 root.resizable(True, True)
 canvas = tk.Canvas(root, width=WIDTH, height=HEIGHT, highlightthickness=0)
 canvas.pack(fill="both", expand=True)
+
+
+def show_start_menu():
+  """Choose the game mode in the game window before entering the map."""
+  menu = tk.Toplevel(root)
+  menu.title("DOOM GAME MODE")
+  menu.geometry("380x260")
+  menu.update_idletasks()
+  menu.geometry("+%d+%d" % ((menu.winfo_screenwidth() - 380) // 2,
+                            (menu.winfo_screenheight() - 260) // 2))
+  menu.resizable(False, False)
+  menu.transient(root)
+  menu.grab_set()
+  tk.Label(menu, text="Choose a game mode", font=("Consolas", 16, "bold")).pack(pady=16)
+
+  def singleplayer():
+    menu.destroy()
+
+  def multiplayer():
+    port = port_entry.get().strip() or "4711"
+    if mode.get() == "host":
+      sys.argv[1:1] = ["--host", port]
+    else:
+      sys.argv[1:1] = ["--join", host_entry.get().strip() or "127.0.0.1", port]
+    menu.destroy()
+    start_network()
+
+  tk.Button(menu, text="Singleplayer", width=24, command=singleplayer).pack(pady=4)
+  mode = tk.StringVar(value="host")
+  tk.Radiobutton(menu, text="Host", variable=mode, value="host").pack()
+  tk.Radiobutton(menu, text="Join", variable=mode, value="join").pack()
+  host_entry = tk.Entry(menu, width=25)
+  host_entry.insert(0, "127.0.0.1")
+  host_entry.pack(pady=2)
+  port_entry = tk.Entry(menu, width=10)
+  port_entry.insert(0, "4711")
+  port_entry.pack(pady=2)
+  tk.Button(menu, text="Start Multiplayer", width=24, command=multiplayer).pack(pady=4)
+  menu.protocol("WM_DELETE_WINDOW", singleplayer)
+  root.wait_window(menu)
 
 
 def toggle_fullscreen():
@@ -221,7 +255,7 @@ def move(dx, dy):
 
 
 def shoot():
-  global score, bullets, shotgun_shells
+  global score, bullets, shotgun_shells, last_shotgun_shot
   if weapon_index == 0:
     if bullets <= 0:
       return
@@ -232,6 +266,10 @@ def shoot():
   else:
     if shotgun_shells <= 0:
       return
+    now = time.perf_counter()
+    if now - last_shotgun_shot < 0.5:
+      return
+    last_shotgun_shot = now
     shotgun_shells -= 1
     damage = 2
     hit_angle = 0.45
@@ -259,88 +297,81 @@ def mouse_look(event):
   center_x = canvas.winfo_width() // 2
   if last_mouse_x is not None:
     delta = event.x - center_x
-    # Ignore the tiny synthetic motion generated while recentering. Apply
-    # real input immediately; queuing it until tick() made turns accumulate
-    # behind the raycast render, especially while moving.
+    # Use movement between consecutive events so reversing direction responds
+    # immediately instead of waiting to cross the original center position.
     if abs(delta) > 1:
       angle += delta * 0.00045
+      recenter_mouse()
   last_mouse_x = center_x
-  recenter_mouse()
 
 
 def reset_mouse_tracking(event):
+  event.widget.focus_set()
+  canvas.grab_set()
+  lock_mouse()
+
+
+def lock_mouse():
   global last_mouse_x, mouse_locked
   mouse_locked = True
   canvas.configure(cursor="none")
-  event.widget.focus_set()
+  canvas.focus_set()
   last_mouse_x = canvas.winfo_width() // 2
   recenter_mouse()
 
 
+def unlock_mouse():
+  """Release mouse capture so the end-of-level button can be selected."""
+  global mouse_locked, last_mouse_x
+  mouse_locked = False
+  last_mouse_x = None
+  canvas.configure(cursor="")
+  canvas.grab_release()
+
+
 def recenter_mouse():
   """Keep the pointer centered so horizontal looking has unlimited range."""
-  if sys.platform == "win32" and mouse_locked and ctypes is not None:
-    root.update_idletasks()
-    x = root.winfo_rootx() + canvas.winfo_width() // 2
-    y = root.winfo_rooty() + canvas.winfo_height() // 2
-    ctypes.windll.user32.SetCursorPos(x, y)
+  global last_mouse_x
+  center_x = canvas.winfo_width() // 2
+  center_y = canvas.winfo_height() // 2
+  screen_x = canvas.winfo_rootx() + center_x
+  screen_y = canvas.winfo_rooty() + center_y
+  # Reposition the Windows cursor after every movement so it cannot leave the
+  # game window while looking around.
+  try:
+    ctypes.windll.user32.SetCursorPos(screen_x, screen_y)
+  except AttributeError:
+    pass
+  last_mouse_x = center_x
 
 
 def reload_weapon():
-  """Refill the weapon's magazine."""
-  global bullets
-  bullets = MAGAZINE_SIZE
+  """Refill the currently selected weapon."""
+  global bullets, shotgun_shells
+  if weapon_index == 0:
+    bullets = MAGAZINE_SIZE
+  elif shotgun_unlocked:
+    shotgun_shells = 8
 
 
 def switch_weapon(direction):
+  """Cycle weapons, keeping the shotgun unavailable until collected."""
   global weapon_index
   if not shotgun_unlocked:
     weapon_index = 0
-    return
-  weapon_index = (weapon_index + direction) % len(weapons)
-
-
-def fire(event=None):
-  """Fire the weapon and provide a short synthesized gunshot sound."""
-  global muzzle_flash, gunshot_audio
-  if event is not None:
-    event.widget.focus_set()
-  if (weapon_index == 0 and bullets <= 0) or (weapon_index == 1 and shotgun_shells <= 0):
-    return
-  shoot()
-  muzzle_flash = 0.10
-  if sys.platform == "win32" and winsound is not None:
-    # Cache the generated sound so shooting never stalls the render loop.
-    if gunshot_audio is None:
-      sample_rate, duration = 44100, 0.24
-      samples = []
-      for index in range(int(sample_rate * duration)):
-        elapsed = index / sample_rate
-        # A sharp transient, noisy blast, and decaying low-end body sound
-        # more like a gunshot than a single constant-frequency beep.
-        crack_envelope = max(0.0, 1.0 - elapsed / 0.035) ** 3
-        body_envelope = max(0.0, 1.0 - elapsed / duration) ** 2
-        crack = math.sin(2 * math.pi * (2400 - 900 * elapsed) * elapsed) * 0.35
-        boom = math.sin(2 * math.pi * 72 * elapsed) * 0.95
-        sub_boom = math.sin(2 * math.pi * 39 * elapsed) * 0.38
-        noise = random.uniform(-1.0, 1.0) * (0.9 * crack_envelope + 0.18 * body_envelope)
-        sample = crack_envelope * (noise + crack) + body_envelope * (boom + sub_boom)
-        sample = max(-1.0, min(1.0, sample / 1.65))
-        samples.append(struct.pack("<h", int(32767 * sample)))
-      audio = io.BytesIO()
-      with wave.open(audio, "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(sample_rate)
-        wav.writeframes(b"".join(samples))
-      gunshot_audio = audio.getvalue()
-    try:
-      winsound.PlaySound(gunshot_audio, winsound.SND_MEMORY | winsound.SND_ASYNC)
-    except (RuntimeError, OSError):
-      # Some Windows audio devices reject memory playback; keep firing usable.
-      root.bell()
   else:
-    root.bell()
+    weapon_index = (weapon_index + direction) % len(weapons)
+
+
+def fire(*_):
+  """Fire from mouse or keyboard input."""
+  global muzzle_flash
+  if game_over:
+    return
+  ammo_before = (bullets, shotgun_shells)
+  shoot()
+  if (bullets, shotgun_shells) != ammo_before:
+    muzzle_flash = 0.12
 
 
 def handle_key_press(event):
@@ -358,7 +389,32 @@ def close_game(event):
   event.widget.winfo_toplevel().destroy()
 
 
+def reset_level():
+  global player, angle, health, score, bullets, shotgun_shells
+  global shotgun_unlocked, weapon_index, enemies, shotgun_pickup, game_over, last_shotgun_shot
+  player = [2.5 * TILE, 2.5 * TILE]
+  angle, health, score = 0.0, 100, 0
+  bullets, shotgun_shells = MAGAZINE_SIZE, 0
+  last_shotgun_shot = -0.5
+  shotgun_unlocked, weapon_index = False, 0
+  enemies = [[x * TILE, y * TILE, 2] for x, y in ENEMY_STARTS]
+  pickup_x, pickup_y = random.choice(pickup_cells)
+  shotgun_pickup = [pickup_x * TILE + TILE / 2, pickup_y * TILE + TILE / 2]
+  game_over = False
+  lock_mouse()
+  tick()
+
+
+def end_button_click(event):
+  if end_button is not None:
+    x1, y1, x2, y2, command = end_button
+    if x1 <= event.x <= x2 and y1 <= event.y <= y2:
+      command()
+
+
 def draw_world():
+  global end_button
+  end_button = None
   canvas.delete("all")
   # Number keys roll the camera left or right.
   roll = 0.06 if "1" in keys else -0.06 if "2" in keys else 0
@@ -519,7 +575,7 @@ def draw_world():
 
 
 def tick():
-  global health, angle, mouse_turn, muzzle_flash, shotgun_pickup, shotgun_shells, shotgun_unlocked, pickup_bob, last_tick_time, strafe_velocity
+  global health, angle, mouse_turn, muzzle_flash, shotgun_pickup, shotgun_shells, shotgun_unlocked, pickup_bob, last_tick_time, strafe_velocity, game_over, end_button
   now = time.perf_counter()
   dt = min(0.05, max(0.001, now - last_tick_time))
   last_tick_time = now
@@ -543,8 +599,16 @@ def tick():
       health = max(0, health - 20 * dt)
   draw_world()
   if not enemies or health <= 0:
+    game_over = True
+    unlock_mouse()
+    label = "YOU WIN!" if not enemies else "YOU DIED"
+    button = "NEXT LEVEL" if not enemies else "TRY AGAIN"
     canvas.create_text(WIDTH // 2, HEIGHT // 2, fill="#ffe45c", font=("Consolas", 42, "bold"),
-               text=("YOU WIN!" if not enemies else "AHHHHHHHHHHHH") + "  (ESC to quit)")
+               text=label)
+    x1, y1, x2, y2 = WIDTH // 2 - 110, HEIGHT // 2 + 45, WIDTH // 2 + 110, HEIGHT // 2 + 90
+    canvas.create_rectangle(x1, y1, x2, y2, fill="#263b5c", outline="#ffe45c", width=2)
+    canvas.create_text(WIDTH // 2, (y1 + y2) // 2, text=button, fill="white", font=("Consolas", 16, "bold"))
+    end_button = (x1, y1, x2, y2, reset_level)
   else:
     # Pace frames from the actual render time instead of accumulating timer drift.
     root.after(8, tick)
@@ -555,10 +619,12 @@ root.bind("<KeyRelease>", lambda event: keys.discard(event.keysym.lower()))
 canvas.bind("<Motion>", mouse_look)
 canvas.bind("<Enter>", reset_mouse_tracking)
 canvas.bind("<Button-1>", fire)
+canvas.bind("<Button-1>", end_button_click, add="+")
 root.bind("<space>", fire)
 root.bind("<F11>", toggle_fullscreen)
 root.bind("<Escape>", close_game)
 canvas.focus_set()
+show_start_menu()
 tick()
 root.mainloop()
 
