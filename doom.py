@@ -41,7 +41,7 @@ remote_names = {}
 respawn_at = None
 PLAYER_ID = f"p{random.SystemRandom().randint(0, 2**31 - 1):08x}"
 network_peer_ids = {}
-username = "PLAYER"
+username = ""
 multiplayer_spawned = False
 
 
@@ -378,17 +378,28 @@ def show_start_menu():
 
   tk.Label(menu, text="Username").pack()
   username_entry = tk.Entry(menu, width=25)
-  username_entry.insert(0, username)
   username_entry.pack(pady=2)
+  username_error = tk.Label(menu, text="Username is required", fg="#b00020")
+
+  def set_username():
+    global username
+    value = username_entry.get().strip()[:16]
+    if not value:
+      username_error.pack()
+      username_entry.focus_set()
+      return False
+    username = value
+    username_error.pack_forget()
+    return True
 
   def singleplayer():
-    global username
-    username = username_entry.get().strip()[:16] or "PLAYER"
+    if not set_username():
+      return
     menu.destroy()
 
   def multiplayer():
-    global username
-    username = username_entry.get().strip()[:16] or "PLAYER"
+    if not set_username():
+      return
     port = port_entry.get().strip() or "4711"
     if mode.get() == "host":
       sys.argv[1:1] = ["--host", port]
