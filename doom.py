@@ -803,7 +803,9 @@ def tick():
       if health > 0:
         health = max(0, health - 20 * dt)
   draw_world()
-  if (not network and health <= 0) or not enemies:
+  # Multiplayer is an ongoing deathmatch: the enemy list is intentionally
+  # empty, so it must not trigger the single-player victory screen.
+  if not network and (health <= 0 or not enemies):
     game_over = True
     unlock_mouse()
     label = "YOU WIN!" if not enemies else "YOU DIED"
