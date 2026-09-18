@@ -38,6 +38,8 @@ network_status = "SINGLEPLAYER"
 remote_health = {}
 remote_kills = {}
 respawn_at = None
+PLAYER_ID = f"p{random.SystemRandom().randint(0, 2**31 - 1):08x}"
+network_peer_ids = {}
 
 
 def network_loop(sock):
@@ -116,6 +118,7 @@ def network_loop(sock):
         except ValueError:
           continue
         with network_lock:
+          network_peer_ids[sock] = parts[1]
           remote_players[parts[1]] = state
           remote_health[parts[1]] = remote_player_health
           remote_kills[parts[1]] = remote_player_kills
@@ -127,6 +130,14 @@ def network_loop(sock):
   with network_peers_lock:
     if sock in network_peers:
       network_peers.remove(sock)
+  # Remove disconnected players, allowing the same user to reconnect without
+  # leaving a stale player visible in the current match.
+  with network_lock:
+    player_id = network_peer_ids.pop(sock, None)
+    if player_id:
+      remote_players.pop(player_id, None)
+      remote_health.pop(player_id, None)
+      remote_kills.pop(player_id, None)
 
 
 def accept_late_players(listener):
@@ -157,10 +168,13 @@ def start_network():
       listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
       listener.bind(("0.0.0.0", port))
-      listener.listen(1)
+      listener.listen(16)
       # Allow the joining player time to enter the host address and connect.
       listener.settimeout(60)
       network = listener.accept()[0]
+      # The initial accept has a timeout only to avoid waiting forever for the
+      # first player; late joins and reconnects should remain possible.
+      listener.settimeout(None)
       with network_peers_lock:
         network_peers.append(network)
       threading.Thread(target=accept_late_players, args=(listener,), daemon=True).start()
@@ -229,7 +243,7 @@ def select_game_mode():
 def send_network_state():
   if network:
     try:
-      packet = f"P local {player[0]:.1f} {player[1]:.1f} {angle:.3f} {health:.1f} {score // 100}\n".encode()
+      packet = f"P {PLAYER_ID} {player[0]:.1f} {player[1]:.1f} {angle:.3f} {health:.1f} {score // 100}\n".encode()
       with network_peers_lock:
         peers = list(network_peers)
       for peer in peers:
@@ -241,7 +255,7 @@ def send_network_state():
 def send_network_shot():
   if network:
     try:
-      packet = f"S local {angle:.3f} {weapon_index}\n".encode()
+      packet = f"S {PLAYER_ID} {angle:.3f} {weapon_index}\n".encode()
       with network_peers_lock:
         peers = list(network_peers)
       for peer in peers:
@@ -777,6 +791,61 @@ def draw_world():
   canvas.create_line(WIDTH // 2 - 10, horizon, WIDTH // 2 + 10, horizon, fill="#f5f5f5", width=2)
   canvas.create_line(WIDTH // 2, horizon - 10, WIDTH // 2, horizon + 10, fill="#f5f5f5", width=2)
   ammo = bullets if not weapon_index else shotgun_shells
+
+  # Kills leaderboard in the upper-left corner.
+  with network_lock:
+    standings = [("YOU", score // 100)] + list(remote_kills.items())
+  standings.sort(key=lambda item: (-item[1], item[0]))
+  board_x, board_y = 12, 44
+  board_width = 190
+  board_height = 30 + 19 * len(standings)
+  canvas.create_rectangle(board_x, board_y, board_x + board_width,
+             board_y + board_height, fill="#10131c", outline="#687080", width=2)
+  canvas.create_text(board_x + 8, board_y + 5, anchor="nw", fill="#ffe45c",
+             font=("Consolas", 11, "bold"), text="KILLS")
+  for row, (name, kills) in enumerate(standings):
+    y = board_y + 25 + row * 19
+    canvas.create_text(board_x + 8, y, anchor="nw", fill="#ffffff",
+             font=("Consolas", 10), text=f"{row + 1}. {name[:12]}")
+    canvas.create_text(board_x + board_width - 8, y, anchor="ne", fill="#ffffff",
+             font=("Consolas", 10, "bold"), text=str(kills))
+
+  # Small top-right map showing walls, players, and enemies.
+  map_scale = 10
+  map_width = len(MAP[0]) * map_scale
+  map_height = len(MAP) * map_scale
+  map_x = WIDTH - map_width - 18
+  map_y = 44
+  canvas.create_rectangle(map_x - 5, map_y - 5, map_x + map_width + 5,
+             map_y + map_height + 5, fill="#10131c", outline="#687080", width=2)
+  for map_row, map_data in enumerate(MAP):
+    for map_col, cell in enumerate(map_data):
+      if cell == "1":
+        canvas.create_rectangle(map_x + map_col * map_scale, map_y + map_row * map_scale,
+             map_x + (map_col + 1) * map_scale, map_y + (map_row + 1) * map_scale,
+             fill="#586171", outline="")
+
+  def minimap_position(world_x, world_y):
+    return (map_x + world_x / TILE * map_scale,
+            map_y + world_y / TILE * map_scale)
+
+  local_x, local_y = minimap_position(*player)
+  canvas.create_oval(local_x - 3, local_y - 3, local_x + 3, local_y + 3,
+             fill="#8ff0a4", outline="")
+  canvas.create_line(local_x, local_y,
+             local_x + math.cos(angle) * 8, local_y + math.sin(angle) * 8,
+             fill="#8ff0a4", width=2)
+  for enemy_x, enemy_y, _ in enemies:
+    marker_x, marker_y = minimap_position(enemy_x, enemy_y)
+    canvas.create_oval(marker_x - 2, marker_y - 2, marker_x + 2, marker_y + 2,
+             fill="#ff5360", outline="")
+  with network_lock:
+    connected_players = list(remote_players.values())
+  for remote_x, remote_y, _ in connected_players:
+    marker_x, marker_y = minimap_position(remote_x, remote_y)
+    canvas.create_oval(marker_x - 2, marker_y - 2, marker_x + 2, marker_y + 2,
+             fill="#8de4ff", outline="")
+
   canvas.create_text(14, 14, anchor="nw", fill="#f5f5f5", font=("Consolas", 15, "bold"),
              text=f"SCORE {score:04d}   {weapons[weapon_index]}")
   canvas.create_text(WIDTH - 14, 14, anchor="ne",
