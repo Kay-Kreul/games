@@ -30,6 +30,8 @@ weapons = ("PISTOL", "SHOTGUN")
 weapon_index = 0
 ENEMY_STARTS = [(8.5, 3.5), (12.5, 7.5), (5.5, 8.5)]
 network = None
+network_peers = []
+network_peers_lock = threading.Lock()
 remote_players = {}
 network_lock = threading.Lock()
 network_status = "SINGLEPLAYER"
@@ -56,6 +58,17 @@ def network_loop(sock):
         parts = line.split()
         if not parts or parts[0] not in ("P", "S", "M"):
           continue
+        # The host relays state and shots so clients that join after the game
+        # has started can still see and damage the other players.
+        if parts[0] in ("P", "S"):
+          with network_peers_lock:
+            peers = list(network_peers)
+          for peer in peers:
+            if peer is not sock:
+              try:
+                peer.sendall((line + "\n").encode())
+              except OSError:
+                pass
         if parts[0] == "M":
           # The host is authoritative for the level seed.  Rebuild locally
           # when it arrives so both players see the same random map and item.
@@ -111,11 +124,30 @@ def network_loop(sock):
     except OSError:
       break
   network_status = "DISCONNECTED"
+  with network_peers_lock:
+    if sock in network_peers:
+      network_peers.remove(sock)
+
+
+def accept_late_players(listener):
+  """Keep the host open so additional players can join during a game."""
+  global network_status
+  while True:
+    try:
+      sock, _ = listener.accept()
+      sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+      sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+      with network_peers_lock:
+        network_peers.append(sock)
+      sock.sendall(f"M {MAP_SEED}\n".encode())
+      threading.Thread(target=network_loop, args=(sock,), daemon=True).start()
+    except OSError:
+      break
 
 
 def start_network():
   """Start LAN mode: `--host [port]` or `--join host [port]`."""
-  global network, network_status, enemies
+  global network, network_status, enemies, network_peers
   try:
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     port = int(sys.argv[3] if mode == "--join" and len(sys.argv) > 3 else
@@ -129,7 +161,9 @@ def start_network():
       # Allow the joining player time to enter the host address and connect.
       listener.settimeout(60)
       network = listener.accept()[0]
-      listener.close()
+      with network_peers_lock:
+        network_peers.append(network)
+      threading.Thread(target=accept_late_players, args=(listener,), daemon=True).start()
       print("Player connected. Starting game.")
     elif mode == "--join" and len(sys.argv) > 2:
       host = sys.argv[2].strip()
@@ -144,6 +178,9 @@ def start_network():
       network.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
       network.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
       network_status = "CONNECTING"
+      with network_peers_lock:
+        if network not in network_peers:
+          network_peers.append(network)
       # The host owns the seed; the joining client replaces its local seed
       # when this packet is received by network_loop().
       if mode == "--host":
@@ -192,7 +229,11 @@ def select_game_mode():
 def send_network_state():
   if network:
     try:
-      network.sendall(f"P local {player[0]:.1f} {player[1]:.1f} {angle:.3f} {health:.1f} {score // 100}\n".encode())
+      packet = f"P local {player[0]:.1f} {player[1]:.1f} {angle:.3f} {health:.1f} {score // 100}\n".encode()
+      with network_peers_lock:
+        peers = list(network_peers)
+      for peer in peers:
+        peer.sendall(packet)
     except OSError:
       pass
 
@@ -200,7 +241,11 @@ def send_network_state():
 def send_network_shot():
   if network:
     try:
-      network.sendall(f"S local {angle:.3f} {weapon_index}\n".encode())
+      packet = f"S local {angle:.3f} {weapon_index}\n".encode()
+      with network_peers_lock:
+        peers = list(network_peers)
+      for peer in peers:
+        peer.sendall(packet)
     except OSError:
       pass
 
@@ -805,7 +850,7 @@ def tick():
   draw_world()
   # Multiplayer is an ongoing deathmatch: the enemy list is intentionally
   # empty, so it must not trigger the single-player victory screen.
-  if not network and (health <= 0 or not enemies):
+  if not network and enemies and (health <= 0 or not enemies):
     game_over = True
     unlock_mouse()
     label = "YOU WIN!" if not enemies else "YOU DIED"
