@@ -9,6 +9,9 @@ import threading
 import time
 import ctypes
 import tkinter as tk
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
 WIDTH, HEIGHT = 1280, 720
@@ -128,6 +131,57 @@ def start_host_discovery():
     discovery_started = True
     threading.Thread(target=discover_hosts, daemon=True).start()
     threading.Thread(target=scan_open_sockets, daemon=True).start()
+
+
+def open_internet_port(port):
+  """Try to make hosting work behind a home router via UPnP.
+
+  Direct TCP connections cannot cross NAT by themselves.  This standard
+  UPnP request asks the local router to forward the game port; if the router
+  does not support UPnP, hosting still works normally with manual forwarding.
+  """
+  message = ("M-SEARCH * HTTP/1.1\r\n"
+             "HOST: 239.255.255.250:1900\r\n"
+             "MAN: \"ssdp:discover\"\r\n"
+             "MX: 1\r\n"
+             "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n")
+  sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+  sock.settimeout(2)
+  try:
+    sock.sendto(message.encode(), ("239.255.255.250", 1900))
+    response, _ = sock.recvfrom(4096)
+    location = next((line.split(":", 1)[1].strip()
+                     for line in response.decode(errors="ignore").splitlines()
+                     if line.lower().startswith("location:")), None)
+    if not location:
+      return None
+    description = urllib.request.urlopen(location, timeout=2).read()
+    root_xml = ET.fromstring(description)
+    namespace = {"u": "urn:schemas-upnp-org:device-1-0"}
+    service = next((item for item in root_xml.findall(".//u:service", namespace)
+                    if "WANIPConnection" in (item.findtext("u:serviceType", "", namespace))), None)
+    if service is None:
+      return None
+    control = urllib.parse.urljoin(location, service.findtext("u:controlURL", "", namespace))
+    local_ip = sock.getsockname()[0]
+    body = ("<?xml version=\"1.0\"?>"
+            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>"
+            "<u:AddPortMapping xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\">"
+            f"<NewRemoteHost></NewRemoteHost><NewExternalPort>{port}</NewExternalPort>"
+            "<NewProtocol>TCP</NewProtocol>"
+            f"<NewInternalPort>{port}</NewInternalPort><NewInternalClient>{local_ip}</NewInternalClient>"
+            "<NewEnabled>1</NewEnabled><NewPortMappingDescription>HOPE</NewPortMappingDescription>"
+            "<NewLeaseDuration>0</NewLeaseDuration></u:AddPortMapping></s:Body></s:Envelope>")
+    request = urllib.request.Request(control, data=body.encode(), method="POST",
+      headers={"Content-Type": "text/xml; charset=\"utf-8\"",
+               "SOAPAction": '"urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping"'})
+    urllib.request.urlopen(request, timeout=3).read()
+    return local_ip
+  except (OSError, ValueError, urllib.error.URLError, ET.ParseError):
+    return None
+  finally:
+    sock.close()
 
 
 def network_loop(sock):
@@ -258,6 +312,7 @@ def accept_late_players(listener):
       with network_peers_lock:
         network_peers.append(sock)
       sock.sendall(f"M {MAP_SEED}\n".encode())
+      network_status = "MULTIPLAYER"
       threading.Thread(target=network_loop, args=(sock,), daemon=True).start()
     except OSError:
       break
@@ -276,16 +331,14 @@ def start_network():
       listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
       listener.bind(("0.0.0.0", port))
       listener.listen(16)
-      # Allow the joining player time to enter the host address and connect.
-      listener.settimeout(60)
-      network = listener.accept()[0]
-      # The initial accept has a timeout only to avoid waiting forever for the
-      # first player; late joins and reconnects should remain possible.
-      listener.settimeout(None)
-      with network_peers_lock:
-        network_peers.append(network)
+      # Keep the listener alive and accept clients in the background.  The
+      # previous blocking accept prevented the game from starting until a
+      # local client connected, and made hosting over the internet awkward.
+      network = listener
+      network_status = "WAITING FOR PLAYER"
+      threading.Thread(target=open_internet_port, args=(port,), daemon=True).start()
       threading.Thread(target=accept_late_players, args=(listener,), daemon=True).start()
-      print("Player connected. Starting game.")
+      threading.Thread(target=announce_host, args=(port,), daemon=True).start()
     elif mode == "--join" and len(sys.argv) > 2:
       host = sys.argv[2].strip()
       if not host:
@@ -305,9 +358,10 @@ def start_network():
       # The host owns the seed; the joining client replaces its local seed
       # when this packet is received by network_loop().
       if mode == "--host":
-        network.sendall(f"M {MAP_SEED}\n".encode())
-        threading.Thread(target=announce_host, args=(port,), daemon=True).start()
-      threading.Thread(target=network_loop, args=(network,), daemon=True).start()
+        # Accepted clients receive the map seed in accept_late_players().
+        pass
+      else:
+        threading.Thread(target=network_loop, args=(network,), daemon=True).start()
   except (OSError, ValueError, IndexError, socket.timeout):
     print("Failed to connect; continuing in singleplayer mode.")
     network = None
