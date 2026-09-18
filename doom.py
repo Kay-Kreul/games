@@ -39,7 +39,7 @@ respawn_at = None
 
 def network_loop(sock):
   """Exchange small JSON-like text packets without affecting the render loop."""
-  global network_status, health
+  global network_status, health, MAP_SEED, MAP, enemies, pickup_cells, shotgun_pickup
   sock.settimeout(0.15)
   buffer = ""
   network_status = "MULTIPLAYER"
@@ -53,7 +53,24 @@ def network_loop(sock):
       buffer = lines.pop()
       for line in lines:
         parts = line.split()
-        if not parts or parts[0] not in ("P", "S"):
+        if not parts or parts[0] not in ("P", "S", "M"):
+          continue
+        if parts[0] == "M":
+          # The host is authoritative for the level seed.  Rebuild locally
+          # when it arrives so both players see the same random map and item.
+          if len(parts) < 2:
+            continue
+          try:
+            MAP_SEED = int(parts[1])
+          except ValueError:
+            continue
+          MAP = make_map()
+          enemies = [[x * TILE, y * TILE, 2] for x, y in ENEMY_STARTS]
+          pickup_cells = [(x, y) for y, row in enumerate(MAP) for x, cell in enumerate(row)
+                          if cell == "." and (x, y) not in {(2, 2), (3, 2), (2, 3)}
+                          and (x, y) not in {(int(ex), int(ey)) for ex, ey in ENEMY_STARTS}]
+          pickup_x, pickup_y = random.Random(MAP_SEED + 1).choice(pickup_cells)
+          shotgun_pickup = [pickup_x * TILE + TILE / 2, pickup_y * TILE + TILE / 2]
           continue
         if parts[0] == "S":
           if len(parts) < 4:
@@ -123,6 +140,10 @@ def start_network():
       network.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
       network.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
       network_status = "CONNECTING"
+      # The host owns the seed; the joining client replaces its local seed
+      # when this packet is received by network_loop().
+      if mode == "--host":
+        network.sendall(f"M {MAP_SEED}\n".encode())
       threading.Thread(target=network_loop, args=(network,), daemon=True).start()
   except (OSError, ValueError, IndexError, socket.timeout):
     print("Failed to connect; continuing in singleplayer mode.")
@@ -315,6 +336,23 @@ def blocked(x, y):
     return gy < 0 or gy >= len(MAP) or gx < 0 or gx >= len(MAP[0]) or MAP[gy][gx] == "1"
 
 
+def circle_hits_wall(x, y, radius):
+  """Use a true circular hitbox against nearby wall rectangles."""
+  left = max(0, int((x - radius) // TILE) - 1)
+  right = min(len(MAP[0]) - 1, int((x + radius) // TILE) + 1)
+  top = max(0, int((y - radius) // TILE) - 1)
+  bottom = min(len(MAP) - 1, int((y + radius) // TILE) + 1)
+  for gy in range(top, bottom + 1):
+    for gx in range(left, right + 1):
+      if MAP[gy][gx] != "1":
+        continue
+      nearest_x = max(gx * TILE, min(x, (gx + 1) * TILE))
+      nearest_y = max(gy * TILE, min(y, (gy + 1) * TILE))
+      if math.hypot(x - nearest_x, y - nearest_y) < radius:
+        return True
+  return False
+
+
 def view_origin():
   """Return the camera position, shifted sideways while leaning."""
   lean = -5 if "1" in keys else 5 if "2" in keys else 0
@@ -337,17 +375,9 @@ def visible(x, y):
 
 
 def move(dx, dy):
-    if not any(blocked(player[0] + dx + ox, player[1] + oy)
-               for ox, oy in ((-PLAYER_RADIUS, -PLAYER_RADIUS),
-                              (PLAYER_RADIUS, -PLAYER_RADIUS),
-                              (-PLAYER_RADIUS, PLAYER_RADIUS),
-                              (PLAYER_RADIUS, PLAYER_RADIUS))):
+  if not circle_hits_wall(player[0] + dx, player[1], PLAYER_RADIUS):
       player[0] += dx
-    if not any(blocked(player[0] + ox, player[1] + dy + oy)
-               for ox, oy in ((-PLAYER_RADIUS, -PLAYER_RADIUS),
-                              (PLAYER_RADIUS, -PLAYER_RADIUS),
-                              (-PLAYER_RADIUS, PLAYER_RADIUS),
-                              (PLAYER_RADIUS, PLAYER_RADIUS))):
+  if not circle_hits_wall(player[0], player[1] + dy, PLAYER_RADIUS):
       player[1] += dy
 
 
@@ -591,8 +621,11 @@ def draw_world():
       x = int(WIDTH / 2 + math.tan(relative) * WIDTH / (2 * math.tan(fov / 2)))
       size = max(12, int(24000 / distance))
       y = horizon - size // 2
-      canvas.create_rectangle(x - size // 3, y, x + size // 3, y + size, fill="#8f1824", outline="#ff5360")
-      # A more readable monster silhouette: horns, shoulders, arms, and boots.
+      # Layered demon model with a distinct body, armor, core, and face.
+      canvas.create_oval(x - size // 3, y - size // 10, x + size // 3,
+             y + size // 2, fill="#4b0e18", outline="#ff5360", width=2)
+      canvas.create_rectangle(x - size // 3, y + size // 8, x + size // 3,
+              y + size, fill="#8f1824", outline="#ff5360", width=2)
       canvas.create_polygon(x - size // 3, y + size // 4,
              x - size // 2, y + size // 2, x - size // 3, y + 3 * size // 5,
              fill="#6e101b", outline="#ff5360")
@@ -611,11 +644,16 @@ def draw_world():
              x + size // 12, y + size // 10, fill="#c4373d", outline="#ff5360")
       canvas.create_oval(x - size // 5, y + size // 20, x + size // 5,
                  y + 2 * size // 5, fill="#e6be78", outline="")
+      canvas.create_polygon(x - size // 8, y + size // 3, x, y + size // 5,
+                x + size // 8, y + size // 3, x, y + size // 2,
+                fill="#ffb52e", outline="#fff06a")
       eye_y = y + size // 5
       canvas.create_oval(x - size // 9, eye_y, x - size // 18, eye_y + size // 12,
              fill="#fff06a", outline="")
       canvas.create_oval(x + size // 18, eye_y, x + size // 9, eye_y + size // 12,
              fill="#fff06a", outline="")
+      canvas.create_line(x - size // 5, y + size // 2, x + size // 5,
+             y + size // 2, fill="#ff5360", width=max(1, size // 18))
 
   # Draw connected players as simple colored marine models.
   with network_lock:
@@ -635,9 +673,17 @@ def draw_world():
       canvas.create_oval(x - size // 4, y, x + size // 4, y + size // 2,
              fill="#b9c9d3", outline="#efffff", width=2)
       canvas.create_rectangle(x - size // 5, y + size // 8, x + size // 5,
+             y + size // 4, fill="#142331", outline="#8de4ff", width=2)
+      canvas.create_rectangle(x - size // 5, y + size // 8, x + size // 5,
               y + size // 3, fill="#263d50", outline="#8de4ff")
       canvas.create_rectangle(x - size // 3, y + size // 2, x + size // 3,
               y + size, fill="#28709b", outline="#bcecff", width=2)
+      canvas.create_polygon(x - size // 5, y + size // 3, x - size // 2,
+            y + size // 2, x - size // 3, y + size * 3 // 5,
+              fill="#3d8fba", outline="#bcecff")
+      canvas.create_polygon(x + size // 5, y + size // 3, x + size // 3,
+              y + size // 2, x + size // 3, y + size * 3 // 5,
+              fill="#3d8fba", outline="#bcecff")
       canvas.create_line(x - size // 6, y + size, x - size // 6, y + size * 6 // 5,
              fill="#182b3a", width=max(3, size // 8))
       canvas.create_line(x + size // 6, y + size, x + size // 6, y + size * 6 // 5,
@@ -749,7 +795,7 @@ def tick():
     shotgun_shells = SHOTGUN_MAGAZINE_SIZE
     switch_weapon(1)
   for enemy in enemies:
-    if math.hypot(enemy[0] - player[0], enemy[1] - player[1]) < 120:
+    if math.hypot(enemy[0] - player[0], enemy[1] - player[1]) < PLAYER_RADIUS + ENEMY_RADIUS + 18:
       if health > 0:
         health = max(0, health - 20 * dt)
   draw_world()
