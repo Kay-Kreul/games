@@ -383,6 +383,8 @@ def start_network():
   global network, network_status, enemies, network_peers
   try:
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode not in ("--host", "--join"):
+      raise ValueError("missing multiplayer mode")
     port = int(sys.argv[3] if mode == "--join" and len(sys.argv) > 3 else
                sys.argv[2] if mode == "--host" and len(sys.argv) > 2 else 4711)
     if mode == "--host":
@@ -406,13 +408,13 @@ def start_network():
       if not host:
         raise ValueError("missing host address")
       print(f"Joining multiplayer host {host} on port {port}...")
-      network = socket.create_connection((host, port), timeout=10)
+      client = socket.create_connection((host, port), timeout=10)
+      client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+      client.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+      network = client
       print("Connected to host. Starting game.")
     if network:
       enemies = []
-      # Position packets are small and should be sent immediately.
-      network.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-      network.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
       network_status = "CONNECTING"
       with network_peers_lock:
         if network not in network_peers:
@@ -424,8 +426,8 @@ def start_network():
         pass
       else:
         threading.Thread(target=network_loop, args=(network,), daemon=True).start()
-  except (OSError, ValueError, IndexError, socket.timeout):
-    print("Failed to connect; continuing in singleplayer mode.")
+  except (OSError, ValueError, IndexError, socket.timeout) as error:
+    print(f"Failed to start multiplayer ({error}); continuing in singleplayer mode.")
     network = None
     network_status = "SINGLEPLAYER"
 
