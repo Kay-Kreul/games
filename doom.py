@@ -34,6 +34,7 @@ remote_players = {}
 network_lock = threading.Lock()
 network_status = "SINGLEPLAYER"
 remote_health = {}
+remote_kills = {}
 respawn_at = None
 
 
@@ -65,7 +66,7 @@ def network_loop(sock):
           except ValueError:
             continue
           MAP = make_map()
-          enemies = [[x * TILE, y * TILE, 2] for x, y in ENEMY_STARTS]
+          enemies = []
           pickup_cells = [(x, y) for y, row in enumerate(MAP) for x, cell in enumerate(row)
                           if cell == "." and (x, y) not in {(2, 2), (3, 2), (2, 3)}
                           and (x, y) not in {(int(ex), int(ey)) for ex, ey in ENEMY_STARTS}]
@@ -98,11 +99,13 @@ def network_loop(sock):
           state = (float(parts[2]), float(parts[3]),
                    float(parts[4]) if len(parts) > 4 else 0.0)
           remote_player_health = float(parts[5]) if len(parts) > 5 else 100.0
+          remote_player_kills = int(float(parts[6])) if len(parts) > 6 else 0
         except ValueError:
           continue
         with network_lock:
           remote_players[parts[1]] = state
           remote_health[parts[1]] = remote_player_health
+          remote_kills[parts[1]] = remote_player_kills
     except socket.timeout:
       continue
     except OSError:
@@ -112,7 +115,7 @@ def network_loop(sock):
 
 def start_network():
   """Start LAN mode: `--host [port]` or `--join host [port]`."""
-  global network, network_status
+  global network, network_status, enemies
   try:
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     port = int(sys.argv[3] if mode == "--join" and len(sys.argv) > 3 else
@@ -136,6 +139,7 @@ def start_network():
       network = socket.create_connection((host, port), timeout=10)
       print("Connected to host. Starting game.")
     if network:
+      enemies = []
       # Position packets are small and should be sent immediately.
       network.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
       network.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -188,7 +192,7 @@ def select_game_mode():
 def send_network_state():
   if network:
     try:
-      network.sendall(f"P local {player[0]:.1f} {player[1]:.1f} {angle:.3f} {health:.1f}\n".encode())
+      network.sendall(f"P local {player[0]:.1f} {player[1]:.1f} {angle:.3f} {health:.1f} {score // 100}\n".encode())
     except OSError:
       pass
 
@@ -537,7 +541,7 @@ def reset_level():
   bullets, shotgun_shells = MAGAZINE_SIZE, 0
   last_shotgun_shot = -0.5
   shotgun_unlocked, weapon_index = False, 0
-  enemies = [[x * TILE, y * TILE, 2] for x, y in ENEMY_STARTS]
+  enemies = [] if network else [[x * TILE, y * TILE, 2] for x, y in ENEMY_STARTS]
   pickup_x, pickup_y = random.Random(MAP_SEED + 1).choice(pickup_cells)
   shotgun_pickup = [pickup_x * TILE + TILE / 2, pickup_y * TILE + TILE / 2]
   game_over = False
