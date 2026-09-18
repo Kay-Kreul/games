@@ -1,4 +1,4 @@
-"""A tiny, self-contained Doom-style raycaster using only the Python standard library.
+"""A tiny, self-contained Hope-style raycaster using only the Python standard library.
 Run with: python doom.py
 """
 import math
@@ -43,6 +43,48 @@ PLAYER_ID = f"p{random.SystemRandom().randint(0, 2**31 - 1):08x}"
 network_peer_ids = {}
 username = ""
 multiplayer_spawned = False
+DISCOVERY_PORT = 4712
+discovered_hosts = {}
+discovery_started = False
+
+
+def discover_hosts():
+  """Listen for nearby Hope host announcements."""
+  sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+  try:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("", DISCOVERY_PORT))
+    while True:
+      data, address = sock.recvfrom(256)
+      parts = data.decode(errors="ignore").split()
+      if len(parts) == 3 and parts[0] == "HOPE":
+        discovered_hosts[parts[1][:16]] = (address[0], parts[2])
+  except OSError:
+    pass
+  finally:
+    sock.close()
+
+
+def announce_host(port):
+  """Broadcast the host name and port for Quick Join."""
+  sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+  try:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    while network:
+      sock.sendto(f"HOPE {username or 'Host'} {port}".encode(),
+                  ("<broadcast>", DISCOVERY_PORT))
+      time.sleep(2)
+  except OSError:
+    pass
+  finally:
+    sock.close()
+
+
+def start_host_discovery():
+  global discovery_started
+  if not discovery_started:
+    discovery_started = True
+    threading.Thread(target=discover_hosts, daemon=True).start()
 
 
 def network_loop(sock):
@@ -112,11 +154,18 @@ def network_loop(sock):
               was_alive = health > 0
               health = max(0, health - damage)
               if was_alive and health <= 0:
-                send_network_kill(parts[1])
+                send_network_kill(parts[1], PLAYER_ID)
           continue
         if parts[0] == "K":
-          if len(parts) >= 2 and parts[1] == PLAYER_ID:
-            score += 100
+          if len(parts) >= 3:
+            killer_id = parts[1]
+            if killer_id == PLAYER_ID:
+              score += 100
+            else:
+              # Update the remote leaderboard immediately; position packets
+              # also carry the killer's authoritative total.
+              with network_lock:
+                remote_kills[killer_id] = remote_kills.get(killer_id, 0) + 1
           continue
         if len(parts) < 4:
           continue
@@ -277,10 +326,10 @@ def send_network_shot():
       pass
 
 
-def send_network_kill(victim_id):
+def send_network_kill(killer_id, victim_id):
   if network:
     try:
-      packet = f"K {victim_id}\n".encode()
+      packet = f"K {killer_id} {victim_id}\n".encode()
       with network_peers_lock:
         peers = list(network_peers)
       for peer in peers:
@@ -352,7 +401,7 @@ last_tick_time = time.perf_counter()
 strafe_velocity = 0.0
 root = tk.Tk()
 
-root.title("DOOM: The Python Experiment")
+root.title("HOPE: The Python Experiment")
 fullscreen = True
 root.attributes("-fullscreen", fullscreen)
 root.update_idletasks()
@@ -366,7 +415,7 @@ canvas.pack(fill="both", expand=True)
 def show_start_menu():
   """Choose the game mode in the game window before entering the map."""
   menu = tk.Toplevel(root)
-  menu.title("DOOM GAME MODE")
+  menu.title("HOPE GAME MODE")
   menu.geometry("380x260")
   menu.update_idletasks()
   menu.geometry("+%d+%d" % ((menu.winfo_screenwidth() - 380) // 2,
