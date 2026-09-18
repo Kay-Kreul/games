@@ -28,31 +28,44 @@ ENEMY_STARTS = [(8.5, 3.5), (12.5, 7.5), (5.5, 8.5)]
 network = None
 remote_players = {}
 network_lock = threading.Lock()
+network_status = "SINGLEPLAYER"
 
 
 def network_loop(sock):
   """Exchange small JSON-like text packets without affecting the render loop."""
+  global network_status
   sock.settimeout(0.15)
+  buffer = ""
+  network_status = "MULTIPLAYER"
   while True:
     try:
       packet = sock.recv(4096)
       if not packet:
         break
-      for line in packet.decode(errors="ignore").splitlines():
+      buffer += packet.decode(errors="ignore")
+      lines = buffer.split("\n")
+      buffer = lines.pop()
+      for line in lines:
         parts = line.split()
-        if len(parts) >= 4 and parts[0] == "P":
-          with network_lock:
-            remote_players[parts[1]] = (float(parts[2]), float(parts[3]),
-                                        float(parts[4]) if len(parts) > 4 else 0)
+        if len(parts) < 4 or parts[0] != "P":
+          continue
+        try:
+          state = (float(parts[2]), float(parts[3]),
+                   float(parts[4]) if len(parts) > 4 else 0.0)
+        except ValueError:
+          continue
+        with network_lock:
+          remote_players[parts[1]] = state
     except socket.timeout:
       continue
-    except (OSError, ValueError):
+    except OSError:
       break
+  network_status = "DISCONNECTED"
 
 
 def start_network():
   """Start LAN mode: `--host [port]` or `--join host [port]`."""
-  global network
+  global network, network_status
   try:
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     port = int(sys.argv[3] if mode == "--join" and len(sys.argv) > 3 else
@@ -63,19 +76,28 @@ def start_network():
       listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
       listener.bind(("0.0.0.0", port))
       listener.listen(1)
-      listener.settimeout(10)
+      # Allow the joining player time to enter the host address and connect.
+      listener.settimeout(60)
       network = listener.accept()[0]
       listener.close()
       print("Player connected. Starting game.")
     elif mode == "--join" and len(sys.argv) > 2:
-      print(f"Joining multiplayer host {sys.argv[2]} on port {port}...")
-      network = socket.create_connection((sys.argv[2], port), timeout=5)
+      host = sys.argv[2].strip()
+      if not host:
+        raise ValueError("missing host address")
+      print(f"Joining multiplayer host {host} on port {port}...")
+      network = socket.create_connection((host, port), timeout=10)
       print("Connected to host. Starting game.")
     if network:
+      # Position packets are small and should be sent immediately.
+      network.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+      network.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+      network_status = "CONNECTING"
       threading.Thread(target=network_loop, args=(network,), daemon=True).start()
-  except (OSError, ValueError, IndexError):
-    print("Could not start multiplayer; continuing in singleplayer mode.")
+  except (OSError, ValueError, IndexError, socket.timeout):
+    print("Failed to connect; continuing in singleplayer mode.")
     network = None
+    network_status = "SINGLEPLAYER"
 
 
 def select_game_mode():
@@ -201,13 +223,20 @@ def show_start_menu():
   mode = tk.StringVar(value="host")
   tk.Radiobutton(menu, text="Host", variable=mode, value="host").pack()
   tk.Radiobutton(menu, text="Join", variable=mode, value="join").pack()
+  def update_multiplayer_button(*_):
+    multiplayer_button.config(text=("Start Multiplayer" if mode.get() == "host"
+                                    else "Join Multiplayer"))
+
+  mode.trace_add("write", update_multiplayer_button)
   host_entry = tk.Entry(menu, width=25)
   host_entry.insert(0, "127.0.0.1")
   host_entry.pack(pady=2)
   port_entry = tk.Entry(menu, width=10)
   port_entry.insert(0, "4711")
   port_entry.pack(pady=2)
-  tk.Button(menu, text="Start Multiplayer", width=24, command=multiplayer).pack(pady=4)
+  multiplayer_button = tk.Button(menu, text="Start Multiplayer", width=24,
+                                 command=multiplayer)
+  multiplayer_button.pack(pady=4)
   menu.protocol("WM_DELETE_WINDOW", singleplayer)
   root.wait_window(menu)
 
@@ -541,6 +570,9 @@ def draw_world():
   ammo = bullets if not weapon_index else shotgun_shells
   canvas.create_text(14, 14, anchor="nw", fill="#f5f5f5", font=("Consolas", 15, "bold"),
              text=f"SCORE {score:04d}   {weapons[weapon_index]}")
+  canvas.create_text(WIDTH - 14, 14, anchor="ne",
+             fill="#8ff0a4" if network_status == "MULTIPLAYER" else "#bbbbc5",
+             font=("Consolas", 12, "bold"), text=network_status)
   # Health is shown as a readable bar in the lower-left HUD.
   health_value = max(0, min(100, health))
   health_left, health_top = 14, HEIGHT - 58
