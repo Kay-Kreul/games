@@ -35,7 +35,7 @@ remote_health = {}
 
 def network_loop(sock):
   """Exchange small JSON-like text packets without affecting the render loop."""
-  global network_status
+  global network_status, health
   sock.settimeout(0.15)
   buffer = ""
   network_status = "MULTIPLAYER"
