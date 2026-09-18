@@ -158,15 +158,33 @@ keys = set()
 last_mouse_x = None
 mouse_locked = False
 look_velocity = 0.0
+mouse_turn = 0.0
 muzzle_flash = 0.0
 pickup_bob = 0.0
 gunshot_audio = None
 last_tick_time = time.perf_counter()
+strafe_velocity = 0.0
 select_game_mode()
 root = tk.Tk()
+
 root.title("DOOM: The Python Experiment")
+fullscreen = True
+root.attributes("-fullscreen", fullscreen)
+root.update_idletasks()
+WIDTH, HEIGHT = root.winfo_screenwidth(), root.winfo_screenheight()
+
+root.resizable(True, True)
 canvas = tk.Canvas(root, width=WIDTH, height=HEIGHT, highlightthickness=0)
-canvas.pack()
+canvas.pack(fill="both", expand=True)
+
+
+def toggle_fullscreen():
+  """Toggle actual borderless fullscreen mode."""
+  global fullscreen
+  fullscreen = not fullscreen
+  root.attributes("-fullscreen", fullscreen)
+  if fullscreen:
+    root.focus_force()
 
 
 def blocked(x, y):
@@ -176,7 +194,7 @@ def blocked(x, y):
 
 def view_origin():
   """Return the camera position, shifted sideways while leaning."""
-  lean = -22 if "1" in keys else 22 if "2" in keys else 0
+  lean = -5 if "1" in keys else 5 if "2" in keys else 0
   return (player[0] + math.cos(angle + math.pi / 2) * lean,
           player[1] + math.sin(angle + math.pi / 2) * lean)
 
@@ -235,13 +253,18 @@ def shoot():
 
 def mouse_look(event):
   """Turn using horizontal mouse movement while the pointer is over the game."""
-  global last_mouse_x, look_velocity
+  global last_mouse_x, angle
   if not mouse_locked:
     return
+  center_x = canvas.winfo_width() // 2
   if last_mouse_x is not None:
-    # Smooth the mouse input rather than turning abruptly on every event.
-    look_velocity += (event.x - last_mouse_x) * 0.002
-  last_mouse_x = canvas.winfo_width() // 2
+    delta = event.x - center_x
+    # Ignore the tiny synthetic motion generated while recentering. Apply
+    # real input immediately; queuing it until tick() made turns accumulate
+    # behind the raycast render, especially while moving.
+    if abs(delta) > 1:
+      angle += delta * 0.00045
+  last_mouse_x = center_x
   recenter_mouse()
 
 
@@ -338,8 +361,8 @@ def close_game(event):
 def draw_world():
   canvas.delete("all")
   # Number keys roll the camera left or right.
-  roll = 0.12 if "1" in keys else -0.12 if "2" in keys else 0
-  view_angle = angle - 0.08 if "1" in keys else angle + 0.08 if "2" in keys else angle
+  roll = 0.06 if "1" in keys else -0.06 if "2" in keys else 0
+  view_angle = angle - 0.04 if "1" in keys else angle + 0.04 if "2" in keys else angle
   horizon = HEIGHT // 2
   canvas.create_rectangle(0, 0, WIDTH, horizon, fill="#101525", outline="")
   canvas.create_rectangle(0, horizon, WIDTH, HEIGHT, fill="#30252b", outline="")
@@ -496,17 +519,17 @@ def draw_world():
 
 
 def tick():
-  global health, angle, look_velocity, muzzle_flash, shotgun_pickup, shotgun_shells, shotgun_unlocked, pickup_bob, last_tick_time
+  global health, angle, mouse_turn, muzzle_flash, shotgun_pickup, shotgun_shells, shotgun_unlocked, pickup_bob, last_tick_time, strafe_velocity
   now = time.perf_counter()
   dt = min(0.05, max(0.001, now - last_tick_time))
   last_tick_time = now
-  angle += look_velocity
-  look_velocity *= 0.55
   muzzle_flash = max(0.0, muzzle_flash - dt)
   pickup_bob += dt * 3
-  speed = 150 * dt
-  forward = (("w" in keys) - ("s" in keys)) * speed
-  strafe = (("d" in keys) - ("a" in keys)) * speed
+  forward = (("w" in keys) - ("s" in keys)) * 165 * dt
+  # Smooth strafing so releasing or changing direction does not feel abrupt.
+  target_strafe = (("d" in keys) - ("a" in keys)) * 110
+  strafe_velocity += (target_strafe - strafe_velocity) * (1 - math.exp(-12 * dt))
+  strafe = strafe_velocity * dt
   move(math.cos(angle) * forward + math.cos(angle + math.pi / 2) * strafe,
      math.sin(angle) * forward + math.sin(angle + math.pi / 2) * strafe)
   send_network_state()
@@ -533,6 +556,7 @@ canvas.bind("<Motion>", mouse_look)
 canvas.bind("<Enter>", reset_mouse_tracking)
 canvas.bind("<Button-1>", fire)
 root.bind("<space>", fire)
+root.bind("<F11>", toggle_fullscreen)
 root.bind("<Escape>", close_game)
 canvas.focus_set()
 tick()
