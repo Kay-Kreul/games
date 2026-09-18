@@ -14,6 +14,11 @@ from concurrent.futures import ThreadPoolExecutor
 WIDTH, HEIGHT = 1280, 720
 
 TILE = 64
+# Wider bands greatly reduce Tk canvas objects while remaining smooth at game
+# resolution.  The renderer fills each band, so there are no gaps between it.
+# Larger bands substantially reduce Tk canvas work while remaining visually
+# smooth at fullscreen resolution.
+RENDER_COLUMN_STEP = 6
 MAP_SEED = random.SystemRandom().randint(0, 2**31 - 1)
 PLAYER_RADIUS = 18
 ENEMY_RADIUS = 20
@@ -21,6 +26,7 @@ player = [2.5 * TILE, 2.5 * TILE]
 angle = 0.0
 health = 100
 score = 0
+level = 1
 MAGAZINE_SIZE = 8
 SHOTGUN_MAGAZINE_SIZE = 4
 bullets = MAGAZINE_SIZE
@@ -30,6 +36,7 @@ last_shotgun_shot = -0.5
 weapons = ("PISTOL", "SHOTGUN")
 weapon_index = 0
 ENEMY_STARTS = [(8.5, 3.5), (12.5, 7.5), (5.5, 8.5)]
+SUN_POSITION = (7.5 * TILE, 1.5 * TILE)
 network = None
 network_peers = []
 network_peers_lock = threading.Lock()
@@ -417,8 +424,22 @@ def make_map():
   return rows
 
 
+def create_singleplayer_enemies():
+  """Create the original enemies plus one extra enemy per level."""
+  enemies_for_level = [[x * TILE, y * TILE, 2] for x, y in ENEMY_STARTS]
+  occupied = {(int(x), int(y)) for x, y in ENEMY_STARTS}
+  candidates = [(x, y) for y, row in enumerate(MAP) for x, cell in enumerate(row)
+                if cell == "." and (x, y) not in occupied
+                and (x, y) not in {(2, 2), (3, 2), (2, 3)}]
+  randomizer = random.Random(MAP_SEED + level)
+  randomizer.shuffle(candidates)
+  for x, y in candidates[:max(0, level - 1)]:
+    enemies_for_level.append([x * TILE + TILE / 2, y * TILE + TILE / 2, 2])
+  return enemies_for_level
+
+
 MAP = make_map()
-enemies = [[x * TILE, y * TILE, 2] for x, y in ENEMY_STARTS]
+enemies = create_singleplayer_enemies()
 pickup_cells = [(x, y) for y, row in enumerate(MAP) for x, cell in enumerate(row)
                 if cell == "." and (x, y) not in {(2, 2), (3, 2), (2, 3)}
                 and (x, y) not in {(int(ex), int(ey)) for ex, ey in ENEMY_STARTS}]
@@ -449,6 +470,23 @@ WIDTH, HEIGHT = root.winfo_screenwidth(), root.winfo_screenheight()
 root.resizable(True, True)
 canvas = tk.Canvas(root, width=WIDTH, height=HEIGHT, highlightthickness=0)
 canvas.pack(fill="both", expand=True)
+
+# Keep the sun as one cached image rather than redrawing its outline every
+# frame.  This also prevents the canvas from accumulating thin edge artifacts.
+sun_image = tk.PhotoImage(width=145, height=145)
+for sun_y in range(145):
+  pixels = []
+  for sun_x in range(145):
+    distance = math.hypot(sun_x - 72, sun_y - 72)
+    if distance <= 72:
+      pixels.append("#%02x%02x%02x" % (max(0, int(255 - distance * 1.2)),
+                                      max(0, int(190 - distance * 0.8)), 55))
+    else:
+      pixels.append("#000000")
+  sun_image.put("{" + " ".join(pixels) + "}", to=(0, sun_y))
+  for sun_x in range(145):
+    if math.hypot(sun_x - 72, sun_y - 72) > 72:
+      sun_image.transparency_set(sun_x, sun_y, True)
 
 
 def show_start_menu():
@@ -761,11 +799,12 @@ def close_game(event):
 
 
 def reset_level():
-  global player, angle, health, score, bullets, shotgun_shells, respawn_at
+  global player, angle, health, score, level, bullets, shotgun_shells, respawn_at
   global MAP, MAP_SEED, pickup_cells
   global shotgun_unlocked, weapon_index, enemies, shotgun_pickup, game_over, last_shotgun_shot
   if not network:
     # Use a fresh seed for each single-player restart so the level changes.
+    level += 1
     MAP_SEED = random.SystemRandom().randint(0, 2**31 - 1)
     MAP = make_map()
     pickup_cells = [(x, y) for y, row in enumerate(MAP) for x, cell in enumerate(row)
@@ -776,7 +815,7 @@ def reset_level():
   bullets, shotgun_shells = MAGAZINE_SIZE, 0
   last_shotgun_shot = -0.5
   shotgun_unlocked, weapon_index = False, 0
-  enemies = [] if network else [[x * TILE, y * TILE, 2] for x, y in ENEMY_STARTS]
+  enemies = [] if network else create_singleplayer_enemies()
   pickup_x, pickup_y = random.Random(MAP_SEED + 1).choice(pickup_cells)
   shotgun_pickup = [pickup_x * TILE + TILE / 2, pickup_y * TILE + TILE / 2]
   game_over = False
@@ -816,41 +855,36 @@ def end_button_click(event):
 
 def draw_graphics_backdrop(horizon):
   """Paint a richer atmospheric backdrop without external assets."""
-  # Deep color gradients for a less flat, more dramatic scene.
-  for y in range(horizon):
-    t = y / max(1, horizon)
-    r, g, b = int(7 + 18 * t), int(10 + 17 * t), int(25 + 35 * t)
-    canvas.create_line(0, y, WIDTH, y, fill="#%02x%02x%02x" % (r, g, b))
-  for y in range(horizon, HEIGHT):
-    t = (y - horizon) / max(1, HEIGHT - horizon)
-    r, g, b = int(25 + 38 * t), int(20 + 25 * t), int(28 + 22 * t)
-    canvas.create_line(0, y, WIDTH, y, fill="#%02x%02x%02x" % (r, g, b))
+  # Solid backdrop regions avoid the horizontal scanline artifact caused by
+  # creating one Tk canvas line for every screen row.
+  canvas.create_rectangle(0, 0, WIDTH, horizon, fill="#18213c", outline="")
+  canvas.create_rectangle(0, horizon, WIDTH, HEIGHT, fill="#3f2d38", outline="")
   # Stars, distant haze, and overhead light shafts give the map depth.
-  for index in range(34):
+  for index in range(24):
     x = (index * 347 + MAP_SEED % 271) % max(1, WIDTH)
     y = 25 + (index * 53 + MAP_SEED % 97) % max(30, horizon - 45)
     size = 1 + index % 2
     canvas.create_oval(x, y, x + size, y + size, fill="#7786ad", outline="")
-  for x in range(-WIDTH, WIDTH * 2, 150):
+  for x in range(-WIDTH, WIDTH * 2, 220):
     canvas.create_polygon(x, horizon - 35, x + 70, horizon - 35,
                           x + 260, HEIGHT, x + 80, HEIGHT,
                           fill="#3b2935", outline="")
-  canvas.create_oval(WIDTH // 2 - 72, horizon - 170, WIDTH // 2 + 72,
-                     horizon - 26, fill="#493447", outline="")
+
+
+def draw_sun(horizon, view_angle, fov, origin_x, origin_y):
+  """Draw the sun from a fixed world location, independent of the cursor."""
+  dx, dy = SUN_POSITION[0] - origin_x, SUN_POSITION[1] - origin_y
+  distance = math.hypot(dx, dy)
+  relative = (math.atan2(dy, dx) - view_angle + math.pi) % (2 * math.pi) - math.pi
+  if distance <= 1 or abs(relative) >= fov / 2:
+    return
+  x = int(WIDTH / 2 + math.tan(relative) * WIDTH / (2 * math.tan(fov / 2)))
+  y = horizon - max(80, min(220, int(16000 / distance)))
+  canvas.create_image(x, y, image=sun_image, anchor="center")
 
 
 def draw_vignette():
-  """Add subtle screen edges and a cinematic crosshair."""
-  edge = 90
-  for i in range(5):
-    alpha = 5 + i * 4
-    color = "#%02x%02x%02x" % (alpha, alpha, alpha + 5)
-    canvas.create_rectangle(i * edge // 5, i * edge // 5,
-                            WIDTH - i * edge // 5, HEIGHT - i * edge // 5,
-                            outline=color, width=2)
-  canvas.create_oval(WIDTH // 2 - 15, HEIGHT // 2 - 15,
-                     WIDTH // 2 + 15, HEIGHT // 2 + 15,
-                     outline="#a9d6d0", width=1)
+  """Keep the center of the view clean; aiming is intentionally unobstructed."""
 
 
 def draw_world():
@@ -861,35 +895,32 @@ def draw_world():
   roll = 0.06 if "1" in keys else -0.06 if "2" in keys else 0
   view_angle = angle - 0.04 if "1" in keys else angle + 0.04 if "2" in keys else angle
   horizon = HEIGHT // 2
-  draw_graphics_backdrop(horizon)
   fov = math.pi / 3
   origin_x, origin_y = view_origin()
-  for column in range(0, WIDTH, 2):
+  draw_graphics_backdrop(horizon)
+  draw_sun(horizon, view_angle, fov, origin_x, origin_y)
+  # Render bands instead of one canvas object per pixel column.
+  for column in range(0, WIDTH, RENDER_COLUMN_STEP):
     column_horizon = horizon + int(roll * (column - WIDTH / 2))
-    ray_angle = view_angle - fov / 2 + fov * column / WIDTH
+    ray_angle = view_angle - fov / 2 + fov * (column + RENDER_COLUMN_STEP / 2) / WIDTH
     distance = 1
-    while distance < 900:
+    while distance < 800:
       rx = origin_x + math.cos(ray_angle) * distance
       ry = origin_y + math.sin(ray_angle) * distance
       if blocked(rx, ry):
         break
-      distance += 2
+      # Sampling every few world units is much cheaper and is hidden by the
+      # wide wall bands at this resolution.
+      distance += 5
     distance *= math.cos(ray_angle - view_angle)
     wall_height = min(HEIGHT, int(42000 / max(distance, 1)))
     shade = max(22, min(220, int(24500 / max(distance, 1))))
-    # Alternating bands suggest masonry panels and make walls read as 3-D.
-    band = (int(distance // 18) + column // 28) % 3
-    color = ("#%02x%02x%02x" % (shade, shade // 2, shade // 3) if band else
-             "#%02x%02x%02x" % (min(255, shade + 18), shade // 2, shade // 4))
-    canvas.create_rectangle(column, column_horizon - wall_height // 2, column + 2,
-          column_horizon + wall_height // 2, fill=color, outline="")
-
-  # Floor perspective grid: inexpensive geometry with a strong visual payoff.
-  for depth in range(1, 14):
-    y = horizon + int((HEIGHT - horizon) * (depth / 14) ** 1.7)
-    canvas.create_line(0, y, WIDTH, y, fill="#49343c", width=1)
-  for grid_x in range(-WIDTH, WIDTH * 2, 96):
-    canvas.create_line(WIDTH // 2, horizon, grid_x, HEIGHT, fill="#3b2c35", width=1)
+    # Use smooth distance lighting instead of artificial wall bands or stripes.
+    warm = min(255, shade + 12)
+    color = "#%02x%02x%02x" % (warm, int(shade * 0.56), int(shade * 0.38))
+    canvas.create_rectangle(column, column_horizon - wall_height // 2,
+      min(WIDTH, column + RENDER_COLUMN_STEP),
+      column_horizon + wall_height // 2, fill=color, outline="")
 
   for ex, ey, _ in sorted(enemies, key=lambda e: -math.hypot(e[0] - player[0], e[1] - player[1])):
     dx, dy = ex - origin_x, ey - origin_y
@@ -1003,8 +1034,20 @@ def draw_world():
       WIDTH // 2 - 16, horizon + 70, WIDTH // 2 + 16, horizon - 4,
       WIDTH // 2 + 54, horizon + 84, fill="#ffd447", outline="#fff4a3")
 
-  canvas.create_line(WIDTH // 2 - 10, horizon, WIDTH // 2 + 10, horizon, fill="#f5f5f5", width=2)
-  canvas.create_line(WIDTH // 2, horizon - 10, WIDTH // 2, horizon + 10, fill="#f5f5f5", width=2)
+  # Keep aiming clear and consistent, regardless of the weapon or scene.
+  crosshair_x, crosshair_y = WIDTH // 2, HEIGHT // 2
+  crosshair_color = "#fff4a3" if muzzle_flash > 0 else "#ffffff"
+  canvas.create_line(crosshair_x - 12, crosshair_y, crosshair_x - 4, crosshair_y,
+                     fill=crosshair_color, width=2)
+  canvas.create_line(crosshair_x + 4, crosshair_y, crosshair_x + 12, crosshair_y,
+                     fill=crosshair_color, width=2)
+  canvas.create_line(crosshair_x, crosshair_y - 12, crosshair_x, crosshair_y - 4,
+                     fill=crosshair_color, width=2)
+  canvas.create_line(crosshair_x, crosshair_y + 4, crosshair_x, crosshair_y + 12,
+                     fill=crosshair_color, width=2)
+  canvas.create_oval(crosshair_x - 2, crosshair_y - 2, crosshair_x + 2,
+                     crosshair_y + 2, fill=crosshair_color, outline="")
+
   ammo = bullets if not weapon_index else shotgun_shells
 
   # Kills leaderboard in the upper-left corner.
@@ -1064,7 +1107,7 @@ def draw_world():
              fill="#8de4ff", outline="")
 
   canvas.create_text(14, 14, anchor="nw", fill="#f5f5f5", font=("Consolas", 15, "bold"),
-             text=f"SCORE {score:04d}   {weapons[weapon_index]}")
+             text=f"LEVEL {level}   SCORE {score:04d}   {weapons[weapon_index]}")
   canvas.create_text(WIDTH - 14, 14, anchor="ne",
              fill="#8ff0a4" if network_status == "MULTIPLAYER" else "#bbbbc5",
              font=("Consolas", 12, "bold"), text=network_status)
@@ -1144,7 +1187,7 @@ def tick():
   draw_world()
   # Multiplayer is an ongoing deathmatch: the enemy list is intentionally
   # empty, so it must not trigger the single-player victory screen.
-  if not network and enemies and (health <= 0 or not enemies):
+  if not network and (health <= 0 or not enemies):
     game_over = True
     unlock_mouse()
     label = "YOU WIN!" if not enemies else "YOU DIED"
@@ -1157,7 +1200,10 @@ def tick():
     end_button = (x1, y1, x2, y2, reset_level if not enemies else retry_level)
   else:
     # Pace frames from the actual render time instead of accumulating timer drift.
-    root.after(8, tick)
+    # Avoid queuing frames faster than Tk can render them; this prevents input
+    # lag and timer buildup on slower machines.
+    # Keep a steady frame cadence without flooding Tk's event queue.
+    root.after(16, tick)
 
 
 root.bind("<KeyPress>", handle_key_press)
