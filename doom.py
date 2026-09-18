@@ -416,9 +416,15 @@ def start_network():
     if network:
       enemies = []
       network_status = "CONNECTING"
-      with network_peers_lock:
-        if network not in network_peers:
-          network_peers.append(network)
+      # The host's listening socket is not a connected peer and cannot carry
+      # gameplay packets.  Keeping it in this list prevented the host from
+      # sending its state to accepted clients, so joining players only saw
+      # their own local view.  Accepted sockets are added by
+      # accept_late_players(); clients still register their connected socket.
+      if mode != "--host":
+        with network_peers_lock:
+          if network not in network_peers:
+            network_peers.append(network)
       # The host owns the seed; the joining client replaces its local seed
       # when this packet is received by network_loop().
       if mode == "--host":
@@ -625,13 +631,7 @@ def show_start_menu():
   tk.Label(menu, text="Username").pack()
   username_entry = tk.Entry(menu, width=25)
   username_entry.pack(pady=2)
-  def autofill_username():
-    """Fill the username field with a unique default name."""
-    username_entry.delete(0, tk.END)
-    username_entry.insert(0, f"Player{random.SystemRandom().randint(1000, 9999)}")
-    username_entry.focus_set()
-
-  tk.Button(menu, text="Auto-fill username", command=autofill_username).pack(pady=2)
+  username_entry.insert(0, f"Player{random.SystemRandom().randint(1000, 9999)}")
   username_error = tk.Label(menu, text="Username is required", fg="#b00020")
 
   def set_username():
