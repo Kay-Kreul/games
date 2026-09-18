@@ -820,6 +820,8 @@ def move(dx, dy):
 
 def shoot():
   global score, bullets, shotgun_shells, last_shotgun_shot
+  if health <= 0:
+    return
   if weapon_index == 0:
     if bullets <= 0:
       return
@@ -1331,11 +1333,12 @@ def tick():
     multiplayer_spawned = True
   forward = (("w" in keys) - ("s" in keys)) * 165 * dt if health > 0 else 0
   # Smooth strafing so releasing or changing direction does not feel abrupt.
-  target_strafe = (("d" in keys) - ("a" in keys)) * 110
+  target_strafe = (("d" in keys) - ("a" in keys)) * 110 if health > 0 else 0
   strafe_velocity += (target_strafe - strafe_velocity) * (1 - math.exp(-12 * dt))
   strafe = strafe_velocity * dt
-  move(math.cos(angle) * forward + math.cos(angle + math.pi / 2) * strafe,
-     math.sin(angle) * forward + math.sin(angle + math.pi / 2) * strafe)
+  if health > 0:
+    move(math.cos(angle) * forward + math.cos(angle + math.pi / 2) * strafe,
+       math.sin(angle) * forward + math.sin(angle + math.pi / 2) * strafe)
   send_network_state()
   if health > 0 and shotgun_pickup is not None and math.hypot(shotgun_pickup[0] - player[0], shotgun_pickup[1] - player[1]) < 32:
     shotgun_pickup = None
